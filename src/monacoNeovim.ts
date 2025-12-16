@@ -2,6 +2,7 @@ import * as monaco from "monaco-editor";
 import type { editor as MonacoEditor } from "monaco-editor";
 import { encode } from "./msgpack";
 import { createSharedInputRing, DEFAULT_SHARED_INPUT_BYTES, SharedInputRing } from "./sharedInput";
+import { defaultRuntimePath, defaultWasmPath } from "./paths";
 
 export type StatusEmitter = (text: string, warn?: boolean) => void;
 
@@ -200,8 +201,8 @@ export class MonacoNeovimClient {
   constructor(editor: MonacoEditor.IStandaloneCodeEditor, options: MonacoNeovimOptions = {}) {
     this.editor = editor;
     this.opts = {
-      wasmPath: options.wasmPath ?? "/nvim.wasm",
-      runtimePath: options.runtimePath ?? "/nvim-runtime.tar.gz",
+      wasmPath: options.wasmPath ?? defaultWasmPath,
+      runtimePath: options.runtimePath ?? defaultRuntimePath,
       worker: options.worker ?? null,
       workerUrl: options.workerUrl ?? new URL("./nvimWorker.ts", import.meta.url),
       sharedInputBytes: options.sharedInputBytes ?? DEFAULT_SHARED_INPUT_BYTES,

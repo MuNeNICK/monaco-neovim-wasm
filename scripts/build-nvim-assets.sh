@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build Neovim WASM and runtime tarball, then drop them into monaco-neovim-wasm/public/.
-# Assumes the nvim-wasm repo is available (default: ./nvim-wasm submodule).
-# This script deliberately avoids cleaning or overriding nvim-wasm internals.
-
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT_DIR="$ROOT_DIR/public"
+if [ -n "${OUT_DIR:-}" ]; then
+  OUT_DIRS="$OUT_DIR"
+else
+  OUT_DIRS="${OUT_DIRS:-public dist}"
+fi
 NVIM_WASM_DIR="${NVIM_WASM_DIR:-$ROOT_DIR/nvim-wasm}"
 HOST_BUILD_DIR="$NVIM_WASM_DIR/build-host"
 HOST_DEPS_DIR="$HOST_BUILD_DIR/.deps"
@@ -18,7 +18,9 @@ if [ ! -d "$NVIM_WASM_DIR" ]; then
   exit 1
 fi
 
-mkdir -p "$OUT_DIR"
+for dir in $OUT_DIRS; do
+  mkdir -p "$ROOT_DIR/$dir"
+done
 
 pushd "$NVIM_WASM_DIR" >/dev/null
 
@@ -56,10 +58,16 @@ if [ ! -f "$HOST_BUILD_DIR/libnlua0-host.so" ] && [ -f "$HOST_BUILD_DIR/lib/libn
 fi
 make wasm-deps
 make wasm
-cp build-wasm/bin/nvim "$OUT_DIR/nvim.wasm"
-tar -czf "$OUT_DIR/nvim-runtime.tar.gz" \
-  -C "$NVIM_WASM_DIR/neovim" runtime \
-  -C "$NVIM_WASM_DIR/build-wasm" usr nvim_version.lua
+for dir in $OUT_DIRS; do
+  cp build-wasm/bin/nvim "$ROOT_DIR/$dir/nvim.wasm"
+  tar -czf "$ROOT_DIR/$dir/nvim-runtime.tar.gz" \
+    -C "$NVIM_WASM_DIR/neovim" runtime \
+    -C "$NVIM_WASM_DIR/build-wasm" usr nvim_version.lua
+done
 popd >/dev/null
 
-echo "Artifacts written to: $OUT_DIR/nvim.wasm and $OUT_DIR/nvim-runtime.tar.gz"
+echo "Artifacts written to:"
+for dir in $OUT_DIRS; do
+  echo " - $dir/nvim.wasm"
+  echo " - $dir/nvim-runtime.tar.gz"
+done

@@ -14,7 +14,7 @@ npm install
 npm run dev
 ```
 3) Open http://localhost:8080, press `i`, type. Vim toggle is in the top bar.
-4) Serve with COOP/COEP so `SharedArrayBuffer` works (dev server already does).
+4) Serve with COOP/COEP so `SharedArrayBuffer` works (dev server already does). `defaultWasmPath`/`defaultRuntimePath` point to the packaged `nvim.wasm` and `nvim-runtime.tar.gz`.
 
 ## Usage in code
 ```ts

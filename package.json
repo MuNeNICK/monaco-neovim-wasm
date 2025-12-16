@@ -9,8 +9,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "build:assets": "bash ./scripts/build-nvim-assets.sh",
-    "prepack": "npm run build"
+    "build:assets": "bash ./scripts/build-nvim-assets.sh"
   },
   "dependencies": {
     "@bjorn3/browser_wasi_shim": "^0.4.2",
@@ -23,8 +22,6 @@
   },
   "files": [
     "dist",
-    "public/nvim.wasm",
-    "public/nvim-runtime.tar.gz",
     "README.md",
     "package.json"
   ]
