@@ -63,44 +63,51 @@ fi
 # Respect upstream Makefile; ensure the bundled host Lua/luac are discoverable so configure does not fail.
 export HOST_LUA_PRG="$HOST_DEPS_PREFIX/bin/lua"
 export HOST_LUAC="$HOST_DEPS_PREFIX/bin/luac"
-export PATH="$HOST_DEPS_PREFIX/bin:$PATH"
 export CMAKE_PREFIX_PATH="$HOST_DEPS_PREFIX:$HOST_DEPS_PREFIX/lib/cmake:$HOST_DEPS_PREFIX/lib${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
 export PKG_CONFIG_PATH="$HOST_DEPS_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 export LUV_LIBRARY="$HOST_DEPS_PREFIX/lib/libluv.a"
 export LUV_INCLUDE_DIR="$HOST_DEPS_PREFIX/include"
 
-# Build host Lua/codegen helpers, then dependencies so CI can execute in a clean workspace.
-(
-  export HOST_LUA_PRG HOST_LUAC PATH CMAKE_PREFIX_PATH PKG_CONFIG_PATH LUV_LIBRARY LUV_INCLUDE_DIR
+# Build host Lua/codegen helpers with host-only environment.
+PATH="$HOST_DEPS_PREFIX/bin:$PATH" \
+  CMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH" \
+  PKG_CONFIG_PATH="$PKG_CONFIG_PATH" \
+  LUV_LIBRARY="$LUV_LIBRARY" LUV_INCLUDE_DIR="$LUV_INCLUDE_DIR" \
+  HOST_LUA_PRG="$HOST_LUA_PRG" HOST_LUAC="$HOST_LUAC" \
   DEPS_BUILD_DIR="$HOST_DEPS_DIR" make host-lua
-  # Safety net: ensure host lua/luac exist where the Makefile expects them.
-  if [ ! -x "$HOST_LUA_PRG" ]; then
-    found_lua="$(find "$HOST_DEPS_DIR" -path '*/bin/lua' -type f -print -quit || true)"
-    if [ -n "$found_lua" ]; then
-      mkdir -p "$(dirname "$HOST_LUA_PRG")"
-      cp "$found_lua" "$HOST_LUA_PRG"
-      chmod +x "$HOST_LUA_PRG"
-    else
-      echo "host lua missing at $HOST_LUA_PRG" >&2
-      exit 1
-    fi
-  fi
-  if [ ! -x "$HOST_LUAC" ]; then
-    found_luac="$(find "$HOST_DEPS_DIR" -path '*/bin/luac' -type f -print -quit || true)"
-    if [ -n "$found_luac" ]; then
-      mkdir -p "$(dirname "$HOST_LUAC")"
-      cp "$found_luac" "$HOST_LUAC"
-      chmod +x "$HOST_LUAC"
-    else
-      echo "host luac missing at $HOST_LUAC" >&2
-      exit 1
-    fi
-  fi
-)
 
-# Build wasm deps and wasm (run without host-only overrides leaking in).
-make wasm-deps
-make wasm
+# Safety net: ensure host lua/luac exist where the Makefile expects them.
+if [ ! -x "$HOST_LUA_PRG" ]; then
+  found_lua="$(find "$HOST_DEPS_DIR" -path '*/bin/lua' -type f -print -quit || true)"
+  if [ -n "$found_lua" ]; then
+    mkdir -p "$(dirname "$HOST_LUA_PRG")"
+    cp "$found_lua" "$HOST_LUA_PRG"
+    chmod +x "$HOST_LUA_PRG"
+  else
+    echo "host lua missing at $HOST_LUA_PRG" >&2
+    exit 1
+  fi
+fi
+if [ ! -x "$HOST_LUAC" ]; then
+  found_luac="$(find "$HOST_DEPS_DIR" -path '*/bin/luac' -type f -print -quit || true)"
+  if [ -n "$found_luac" ]; then
+    mkdir -p "$(dirname "$HOST_LUAC")"
+    cp "$found_luac" "$HOST_LUAC"
+    chmod +x "$HOST_LUAC"
+  else
+    echo "host luac missing at $HOST_LUAC" >&2
+    exit 1
+  fi
+fi
+# Mirror nvim-wasm/Makefile defaults so host_lua_gen.py resolves the same paths.
+export HOST_LUA_PRG_DEFAULT="$HOST_LUA_PRG"
+export HOST_LUAC_DEFAULT="$HOST_LUAC"
+export HOST_NLUA0_DEFAULT="$HOST_BUILD_DIR/libnlua0-host.so"
+export HOST_NLUA0="$HOST_NLUA0_DEFAULT"
+
+# Build wasm deps and wasm with minimal overrides; PATH includes host bin so host_lua_gen.py finds lua.
+PATH="$HOST_DEPS_PREFIX/bin:$PATH" HOST_LUA_PRG="$HOST_LUA_PRG" HOST_LUAC="$HOST_LUAC" make wasm-deps
+PATH="$HOST_DEPS_PREFIX/bin:$PATH" HOST_LUA_PRG="$HOST_LUA_PRG" HOST_LUAC="$HOST_LUAC" make wasm
 # Some host builds drop libnlua0 into build-host/lib/; copy it to the expected host path
 # so host_lua_gen.py uses the native lib instead of the wasm one.
 if [ ! -f "$HOST_BUILD_DIR/libnlua0-host.so" ] && [ -f "$HOST_BUILD_DIR/lib/libnlua0.so" ]; then
