@@ -18,6 +18,16 @@ if [ ! -d "$NVIM_WASM_DIR" ]; then
   exit 1
 fi
 
+# Ensure upstream neovim sources are available (nvim-wasm keeps them as a submodule).
+if [ ! -d "$NVIM_WASM_DIR/neovim" ]; then
+  if command -v git >/dev/null 2>&1 && [ -d "$NVIM_WASM_DIR/.git" ]; then
+    git -C "$NVIM_WASM_DIR" submodule update --init --recursive
+  else
+    echo "missing neovim sources under $NVIM_WASM_DIR/neovim" >&2
+    exit 1
+  fi
+fi
+
 for dir in $OUT_DIRS; do
   mkdir -p "$ROOT_DIR/$dir"
 done
