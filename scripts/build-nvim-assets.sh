@@ -8,9 +8,8 @@ HOST_BUILD_DIR="$NVIM_WASM_DIR/build-host"
 HOST_DEPS_PREFIX="$HOST_BUILD_DIR/.deps/usr"
 HOST_LUA_PRG="$HOST_DEPS_PREFIX/bin/lua"
 HOST_LUAC="$HOST_DEPS_PREFIX/bin/luac"
-HOST_NLUA0="$HOST_BUILD_DIR/libnlua0-host.so"
-CMAKE_BIN="$(find "$NVIM_WASM_DIR/.toolchains" -path '*/bin/cmake' -type f -print -quit)"
-CMAKE_BIN="${CMAKE_BIN:-$(command -v cmake || true)}"
+HOST_NLUA0="$HOST_BUILD_DIR/lib/libnlua0.so"
+TOOLCHAINS_DIR="$NVIM_WASM_DIR/.toolchains"
 
 if [ -n "${OUT_DIR:-}" ]; then
   OUT_DIRS="$OUT_DIR"
@@ -21,7 +20,7 @@ if [ ! -d "$NVIM_WASM_DIR" ]; then
   exit 1
 fi
 
-# Ensure upstream neovim submodule is present.
+# Ensure upstream neovim sources are available.
 if [ ! -d "$NVIM_WASM_DIR/neovim" ]; then
   git -C "$NVIM_WASM_DIR" submodule update --init --recursive
 fi
@@ -31,12 +30,16 @@ for dir in $OUT_DIRS; do
 done
 
 pushd "$NVIM_WASM_DIR" >/dev/null
+mkdir -p "$TOOLCHAINS_DIR"
 make wasm-build-tools
 
-# Build bundled host deps (Lua, etc.) if headers are missing.
+CMAKE_BIN="$(find "$TOOLCHAINS_DIR" -path '*/bin/cmake' -type f -print -quit)"
+CMAKE_BIN="${CMAKE_BIN:-$(command -v cmake || true)}"
+
+# Ensure bundled host deps (Lua headers/libs) exist.
 if [ ! -f "$HOST_DEPS_PREFIX/include/lua.h" ]; then
   if [ -z "$CMAKE_BIN" ]; then
-    echo "CMake not found for host deps build" >&2
+    echo "CMake not found for deps build" >&2
     exit 1
   fi
   "$CMAKE_BIN" -S neovim/cmake.deps -B "$HOST_BUILD_DIR/.deps" -G "Unix Makefiles" \
@@ -44,7 +47,7 @@ if [ ! -f "$HOST_DEPS_PREFIX/include/lua.h" ]; then
   "$CMAKE_BIN" --build "$HOST_BUILD_DIR/.deps"
 fi
 
-# Build host Lua (native) and nlua0 for codegen.
+# Build host lua + nlua0 (native).
 PATH="$HOST_DEPS_PREFIX/bin:$PATH" \
   CMAKE_PREFIX_PATH="$HOST_DEPS_PREFIX:$HOST_DEPS_PREFIX/lib/cmake:$HOST_DEPS_PREFIX/lib" \
   PKG_CONFIG_PATH="$HOST_DEPS_PREFIX/lib/pkgconfig" \
@@ -55,19 +58,20 @@ if [ ! -x "$HOST_LUA_PRG" ] || [ ! -x "$HOST_LUAC" ]; then
   echo "host lua/luac missing at $HOST_LUA_PRG / $HOST_LUAC" >&2
   exit 1
 fi
-
-# Clean only when FULL_REBUILD=1 to avoid full rebuild on every run.
-if [ "${FULL_REBUILD:-0}" = "1" ]; then
-  PATH="$HOST_DEPS_PREFIX/bin:$PATH" HOST_LUA_PRG="$HOST_LUA_PRG" HOST_LUAC="$HOST_LUAC" make wasm-clean
+if [ ! -f "$HOST_NLUA0" ]; then
+  echo "host nlua0 missing at $HOST_NLUA0" >&2
+  exit 1
 fi
+
+# Build wasm deps and wasm using the host lua.
 PATH="$HOST_DEPS_PREFIX/bin:$PATH" \
   CMAKE_PREFIX_PATH="$HOST_DEPS_PREFIX:$HOST_DEPS_PREFIX/lib/cmake:$HOST_DEPS_PREFIX/lib" \
   PKG_CONFIG_PATH="$HOST_DEPS_PREFIX/lib/pkgconfig" \
-  HOST_LUA_PRG="$HOST_LUA_PRG" HOST_LUAC="$HOST_LUAC" make wasm-deps
+  HOST_LUA_PRG="$HOST_LUA_PRG" HOST_LUAC="$HOST_LUAC" HOST_NLUA0="$HOST_NLUA0" make wasm-deps
 PATH="$HOST_DEPS_PREFIX/bin:$PATH" \
   CMAKE_PREFIX_PATH="$HOST_DEPS_PREFIX:$HOST_DEPS_PREFIX/lib/cmake:$HOST_DEPS_PREFIX/lib" \
   PKG_CONFIG_PATH="$HOST_DEPS_PREFIX/lib/pkgconfig" \
-  HOST_LUA_PRG="$HOST_LUA_PRG" HOST_LUAC="$HOST_LUAC" make wasm
+  HOST_LUA_PRG="$HOST_LUA_PRG" HOST_LUAC="$HOST_LUAC" HOST_NLUA0="$HOST_NLUA0" make wasm
 
 for dir in $OUT_DIRS; do
   cp build-wasm/bin/nvim "$ROOT_DIR/$dir/nvim.wasm"
