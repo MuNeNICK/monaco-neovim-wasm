@@ -8,6 +8,7 @@ else
   OUT_DIRS="${OUT_DIRS:-public dist}"
 fi
 NVIM_WASM_DIR="${NVIM_WASM_DIR:-$ROOT_DIR/nvim-wasm}"
+TOOLCHAINS_DIR="$NVIM_WASM_DIR/.toolchains"
 HOST_BUILD_DIR="$NVIM_WASM_DIR/build-host"
 HOST_DEPS_DIR="$HOST_BUILD_DIR/.deps"
 HOST_DEPS_PREFIX="$HOST_DEPS_DIR/usr"
@@ -18,6 +19,7 @@ if [ ! -d "$NVIM_WASM_DIR" ]; then
   exit 1
 fi
 
+mkdir -p "$TOOLCHAINS_DIR"
 for dir in $OUT_DIRS; do
   mkdir -p "$ROOT_DIR/$dir"
 done
@@ -28,7 +30,7 @@ pushd "$NVIM_WASM_DIR" >/dev/null
 make wasm-build-tools
 
 # Build bundled host deps (Lua, libuv, etc.) required by host-lua when the host lacks dev headers.
-CMAKE_BIN="$(find "$NVIM_WASM_DIR/.toolchains" -path '*/bin/cmake' -type f -print -quit)"
+CMAKE_BIN="$(find "$TOOLCHAINS_DIR" -path '*/bin/cmake' -type f -print -quit)"
 CMAKE_BIN="${CMAKE_BIN:-$(command -v cmake || true)}"
 if [ -z "$CMAKE_BIN" ]; then
   echo "CMake not found (tried toolchain + PATH). Install cmake or rerun wasm-build-tools." >&2
