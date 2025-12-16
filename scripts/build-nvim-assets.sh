@@ -8,7 +8,6 @@ else
   OUT_DIRS="${OUT_DIRS:-public dist}"
 fi
 NVIM_WASM_DIR="${NVIM_WASM_DIR:-$ROOT_DIR/nvim-wasm}"
-TOOLCHAINS_DIR="$NVIM_WASM_DIR/.toolchains"
 HOST_BUILD_DIR="$NVIM_WASM_DIR/build-host"
 HOST_DEPS_DIR="$HOST_BUILD_DIR/.deps"
 HOST_DEPS_PREFIX="$HOST_DEPS_DIR/usr"
@@ -25,6 +24,8 @@ for dir in $OUT_DIRS; do
 done
 
 pushd "$NVIM_WASM_DIR" >/dev/null
+TOOLCHAINS_DIR="$(pwd)/.toolchains"
+mkdir -p "$TOOLCHAINS_DIR"
 
 # Ensure CMake toolchain is present before building host deps/host Lua.
 make wasm-build-tools
