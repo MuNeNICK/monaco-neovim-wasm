@@ -64,6 +64,7 @@ fi
 export HOST_LUA_PRG="$HOST_DEPS_PREFIX/bin/lua"
 export HOST_LUAC="$HOST_DEPS_PREFIX/bin/luac"
 export PATH="$HOST_DEPS_PREFIX/bin:$PATH"
+export CMAKE_PREFIX_PATH="$HOST_DEPS_PREFIX:$HOST_DEPS_PREFIX/lib/cmake:$HOST_DEPS_PREFIX/lib${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
 
 # Build host Lua/codegen helpers, then dependencies so CI can execute in a clean workspace.
 DEPS_BUILD_DIR="$HOST_DEPS_DIR" make host-lua
