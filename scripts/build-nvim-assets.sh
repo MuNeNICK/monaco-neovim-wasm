@@ -60,7 +60,11 @@ if [ -f "$HOST_BUILD_DIR/CMakeCache.txt" ] && ! grep -q "$HOST_DEPS_PREFIX" "$HO
   rm -rf "$HOST_BUILD_DIR/CMakeFiles"
 fi
 
-# Respect upstream Makefile; HOST_LUA_PRG can be provided by the caller if needed.
+# Respect upstream Makefile; ensure the bundled host Lua/luac are discoverable so configure does not fail.
+export HOST_LUA_PRG="$HOST_DEPS_PREFIX/bin/lua"
+export HOST_LUAC="$HOST_DEPS_PREFIX/bin/luac"
+export PATH="$HOST_DEPS_PREFIX/bin:$PATH"
+
 # Build host Lua/codegen helpers, then dependencies so CI can execute in a clean workspace.
 DEPS_BUILD_DIR="$HOST_DEPS_DIR" make host-lua
 # Some host builds drop libnlua0 into build-host/lib/; copy it to the expected host path
