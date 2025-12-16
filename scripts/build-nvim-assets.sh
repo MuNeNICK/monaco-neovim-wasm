@@ -63,6 +63,11 @@ if [ ! -f "$HOST_NLUA0" ]; then
   exit 1
 fi
 
+# Always clean wasm build dir to avoid stale artifacts.
+PATH="$HOST_DEPS_PREFIX/bin:$PATH" \
+  HOST_LUA_PRG="$HOST_LUA_PRG" HOST_LUAC="$HOST_LUAC" HOST_NLUA0="$HOST_NLUA0" \
+  make wasm-clean
+
 # Build wasm deps and wasm using the host lua.
 PATH="$HOST_DEPS_PREFIX/bin:$PATH" \
   CMAKE_PREFIX_PATH="$HOST_DEPS_PREFIX:$HOST_DEPS_PREFIX/lib/cmake:$HOST_DEPS_PREFIX/lib" \
