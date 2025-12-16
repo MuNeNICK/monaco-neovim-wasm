@@ -1,0 +1,20 @@
+node_modules/
+dist/
+.npm/
+.DS_Store
+npm-debug.log
+pnpm-debug.log
+
+# Generated WASM assets
+public/nvim.wasm
+public/nvim-runtime.tar.gz
+
+# Submodule build outputs
+nvim-wasm/build-*/
+nvim-wasm/.toolchains/
+nvim-wasm/.deps-download-wasm
+nvim-wasm/.deps-download
+nvim-wasm/.cache/
+nvim-wasm/.clangd
+nvim-wasm/.ccls-cache/
+nvim-wasm/.vscode/

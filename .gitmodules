@@ -1,0 +1,3 @@
+[submodule "nvim-wasm"]
+	path = nvim-wasm
+	url = https://github.com/MuNeNICK/nvim-wasm.git

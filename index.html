@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Monaco + Neovim WASM</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body { margin: 0; font-family: sans-serif; background: #f7f7f7; color: #111; }
+      #bar { display: flex; gap: 12px; align-items: center; padding: 8px 12px; }
+      #toggle { padding: 6px 10px; }
+      #status { font-size: 14px; }
+      #mode { font-family: ui-monospace, monospace; font-size: 13px; }
+      #editor { height: calc(100vh - 40px); }
+    </style>
+  </head>
+  <body>
+    <div id="bar">
+      <button id="toggle">Vim: on</button>
+      <span id="status">idle</span>
+      <span id="mode">mode: -</span>
+    </div>
+    <div id="editor"></div>
+    <script type="module" src="/demo/main.ts"></script>
+  </body>
+</html>
