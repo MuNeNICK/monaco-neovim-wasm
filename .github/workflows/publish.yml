@@ -24,7 +24,7 @@ jobs:
         run: npm ci
 
       - name: Build WASM assets
-        run: NVIM_WASM_DIR=./nvim-wasm npm run build:assets
+        run: npm run build:assets
 
       - name: Build package
         run: npm run build

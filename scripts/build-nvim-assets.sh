@@ -4,12 +4,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIRS="${OUT_DIRS:-public dist}"
 NVIM_WASM_DIR="${NVIM_WASM_DIR:-$ROOT_DIR/nvim-wasm}"
-HOST_BUILD_DIR="$NVIM_WASM_DIR/build-host"
-HOST_DEPS_PREFIX="$HOST_BUILD_DIR/.deps/usr"
-HOST_LUA_PRG="$HOST_DEPS_PREFIX/bin/lua"
-HOST_LUAC="$HOST_DEPS_PREFIX/bin/luac"
-HOST_NLUA0="$HOST_BUILD_DIR/lib/libnlua0.so"
-TOOLCHAINS_DIR="$NVIM_WASM_DIR/.toolchains"
+if [[ "$NVIM_WASM_DIR" != /* ]]; then
+  NVIM_WASM_DIR="$ROOT_DIR/$NVIM_WASM_DIR"
+fi
 
 if [ -n "${OUT_DIR:-}" ]; then
   OUT_DIRS="$OUT_DIR"
@@ -19,6 +16,14 @@ if [ ! -d "$NVIM_WASM_DIR" ]; then
   echo "nvim-wasm repo not found. Set NVIM_WASM_DIR to the clone path." >&2
   exit 1
 fi
+
+NVIM_WASM_DIR="$(cd "$NVIM_WASM_DIR" && pwd)"
+HOST_BUILD_DIR="$NVIM_WASM_DIR/build-host"
+HOST_DEPS_PREFIX="$HOST_BUILD_DIR/.deps/usr"
+HOST_LUA_PRG="$HOST_DEPS_PREFIX/bin/lua"
+HOST_LUAC="$HOST_DEPS_PREFIX/bin/luac"
+HOST_NLUA0="$HOST_BUILD_DIR/lib/libnlua0.so"
+TOOLCHAINS_DIR="$NVIM_WASM_DIR/.toolchains"
 
 # Ensure upstream neovim sources are available.
 if [ ! -d "$NVIM_WASM_DIR/neovim" ]; then
