@@ -13,8 +13,8 @@ type StartMessage = {
   type: "start";
   cols?: number;
   rows?: number;
-  wasmPath?: string;
-  runtimePath?: string;
+  wasmPath: string;
+  runtimePath: string;
   inputBuffer?: SharedArrayBuffer | null;
 };
 
@@ -153,36 +153,28 @@ async function startNvim({ cols, rows, wasmPath, runtimePath, inputBuffer }: Sta
     rpcDecoder = null;
     inputFd = new RingFd(inputBuffer);
 
-    debugStatus("fetching artifacts");
     const [wasmBytes, runtimeArchive] = await Promise.all([
-      fetchBytes(wasmPath || "./nvim.wasm"),
-      fetchBytes(runtimePath || "./nvim-runtime.tar.gz"),
+      fetchBytes(wasmPath),
+      fetchBytes(runtimePath),
     ]);
-    debugStatus(`fetched wasm (${wasmBytes.length} bytes)`);
-    debugStatus(`fetched runtime (${runtimeArchive.length} bytes)`);
 
-    debugStatus("building filesystem");
     let runtimeBytes: Uint8Array;
     if (looksLikeGzip(runtimeArchive)) {
       try {
         runtimeBytes = gunzipSync(runtimeArchive);
-        debugStatus(`gunzipped runtime (${runtimeBytes.length} bytes)`);
       } catch (e) {
         throw new Error(`gunzip runtime failed: ${(e as Error)?.message ?? e}`);
       }
     } else {
       runtimeBytes = runtimeArchive;
-      debugStatus(`runtime already uncompressed (${runtimeBytes.length} bytes); skipping gunzip`);
     }
     let untarred: TarEntry[];
     try {
       untarred = untar(runtimeBytes);
-      debugStatus(`untar entries: ${untarred.length}`);
     } catch (e) {
       throw new Error(`untar runtime failed: ${(e as Error)?.message ?? e}`);
     }
-    const fsRoot = buildFs(untarred, (count) => debugStatus(`filesystem entries: ${count}`));
-    debugStatus("filesystem ready");
+    const fsRoot = buildFs(untarred, () => {});
 
     const stdinFd = inputFd!;
     const stdoutFd = new SinkFd(handleStdout);
@@ -196,7 +188,6 @@ async function startNvim({ cols, rows, wasmPath, runtimePath, inputBuffer }: Sta
     const tmpDir = fsRoot.contents.get("tmp") as Directory | undefined;
     const tmp = tmpDir?.contents || new Map();
     const preopenTmp = new RootedPreopenDirectory("tmp", tmp);
-    debugStatus("configured filesystem");
 
     const args = ["nvim", "--headless", "--embed", "-u", "NORC", "--noplugin", "-i", "NONE", "-n"];
     const env = [
@@ -211,8 +202,7 @@ async function startNvim({ cols, rows, wasmPath, runtimePath, inputBuffer }: Sta
       `COLUMNS=${cols || 120}`,
       `LINES=${rows || 40}`,
     ];
-    debugStatus("creating WASI");
-    activeWasi = new WASI(args, env, [stdinFd, stdoutFd, stderrFd, preopen, preopenTmp], { debug: true });
+    activeWasi = new WASI(args, env, [stdinFd, stdoutFd, stderrFd, preopen, preopenTmp], { debug: false });
     activeWasi.fds[0] = stdinFd;
     activeWasi.fds[1] = stdoutFd;
     activeWasi.fds[2] = stderrFd;
@@ -221,17 +211,14 @@ async function startNvim({ cols, rows, wasmPath, runtimePath, inputBuffer }: Sta
     (activeWasi as unknown as { preopens: Record<string, PreopenDirectory> }).preopens = { "/nvim": preopen, "/tmp": preopenTmp };
 
     const envImports = makeEnv(() => activeWasi?.wasiImport?.proc_exit?.(1));
-    debugStatus("instantiating wasm");
     const wasmInstance = await WebAssembly.instantiate(wasmBytes, {
       wasi_snapshot_preview1: activeWasi.wasiImport,
       env: envImports,
     });
-    debugStatus("starting nvim");
     const instanceSource = wasmInstance as unknown as WebAssembly.WebAssemblyInstantiatedSource;
     const instance = instanceSource.instance
       ?? (wasmInstance as unknown as { instance: WebAssembly.Instance }).instance;
     exitCode = activeWasi.start(instance as any);
-    debugStatus(`nvim exited (${exitCode})`);
   } catch (err) {
     const message = (err as { message?: string })?.message || String(err);
     const stack = (err as { stack?: string })?.stack;
@@ -266,19 +253,6 @@ function toHex(data: Uint8Array): string {
     out += data[i].toString(16).padStart(2, "0");
   }
   return out;
-}
-
-function debugStatus(message: string) {
-  try {
-    postMessage({ type: "start-debug", message });
-  } catch (_) {
-    // ignore
-  }
-  try {
-    postMessage({ type: "shared-ready" });
-  } catch (_) {
-    // ignore
-  }
 }
 
 function handleMessage(msg: unknown) {

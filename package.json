@@ -1,14 +1,13 @@
 {
   "name": "monaco-neovim-wasm",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": false,
   "type": "module",
   "description": "Run real Neovim (WASM) inside Monaco Editor, inspired by monaco-vim but backed by native Neovim RPC.",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview",
+    "build": "vite build && npm run build:types",
     "typecheck": "tsc --noEmit",
+    "build:types": "tsc -p tsconfig.build.json",
     "build:assets": "bash ./scripts/build-nvim-assets.sh"
   },
   "dependencies": {
@@ -19,6 +18,15 @@
   "devDependencies": {
     "typescript": "^5.4.0",
     "vite": "^5.2.0"
+  },
+  "main": "./dist/monaco-neovim-wasm.es.js",
+  "module": "./dist/monaco-neovim-wasm.es.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/monaco-neovim-wasm.es.js"
+    }
   },
   "files": [
     "dist",

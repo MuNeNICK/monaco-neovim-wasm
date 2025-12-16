@@ -22,7 +22,7 @@ HOST_BUILD_DIR="$NVIM_WASM_DIR/build-host"
 HOST_DEPS_PREFIX="$HOST_BUILD_DIR/.deps/usr"
 HOST_LUA_PRG="$HOST_DEPS_PREFIX/bin/lua"
 HOST_LUAC="$HOST_DEPS_PREFIX/bin/luac"
-HOST_NLUA0="$HOST_BUILD_DIR/lib/libnlua0.so"
+HOST_NLUA0=""
 TOOLCHAINS_DIR="$NVIM_WASM_DIR/.toolchains"
 
 # Ensure upstream neovim sources are available.
@@ -56,15 +56,29 @@ fi
 PATH="$HOST_DEPS_PREFIX/bin:$PATH" \
   CMAKE_PREFIX_PATH="$HOST_DEPS_PREFIX:$HOST_DEPS_PREFIX/lib/cmake:$HOST_DEPS_PREFIX/lib" \
   PKG_CONFIG_PATH="$HOST_DEPS_PREFIX/lib/pkgconfig" \
-  HOST_LUA_PRG="$HOST_LUA_PRG" HOST_LUAC="$HOST_LUAC" HOST_NLUA0="$HOST_NLUA0" \
+  HOST_LUA_PRG="$HOST_LUA_PRG" HOST_LUAC="$HOST_LUAC" \
   make host-lua
 
 if [ ! -x "$HOST_LUA_PRG" ] || [ ! -x "$HOST_LUAC" ]; then
   echo "host lua/luac missing at $HOST_LUA_PRG / $HOST_LUAC" >&2
   exit 1
 fi
-if [ ! -f "$HOST_NLUA0" ]; then
-  echo "host nlua0 missing at $HOST_NLUA0" >&2
+for cand in \
+  "$HOST_BUILD_DIR/lib/libnlua0.so" \
+  "$HOST_BUILD_DIR/libnlua0-host.so" \
+  "$HOST_BUILD_DIR/libnlua0.so" \
+  "$HOST_BUILD_DIR/lib/libnlua0.dylib" \
+  "$HOST_BUILD_DIR/libnlua0-host.dylib" \
+  "$HOST_BUILD_DIR/libnlua0.dylib" \
+  "$HOST_BUILD_DIR/nlua0.dll"; do
+  if [ -f "$cand" ]; then
+    HOST_NLUA0="$cand"
+    break
+  fi
+done
+if [ -z "$HOST_NLUA0" ]; then
+  echo "host nlua0 missing under $HOST_BUILD_DIR" >&2
+  find "$HOST_BUILD_DIR" -maxdepth 3 -name 'libnlua0*' -o -name 'nlua0.dll' >&2 || true
   exit 1
 fi
 

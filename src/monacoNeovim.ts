@@ -7,8 +7,6 @@ import { defaultRuntimePath, defaultWasmPath } from "./paths";
 export type StatusEmitter = (text: string, warn?: boolean) => void;
 
 export type MonacoNeovimOptions = {
-  wasmPath?: string;
-  runtimePath?: string;
   worker?: Worker | null;
   workerUrl?: URL;
   useMessagePort?: boolean;
@@ -23,8 +21,6 @@ export type MonacoNeovimOptions = {
 };
 
 type MonacoNeovimResolvedOptions = {
-  wasmPath: string;
-  runtimePath: string;
   worker: Worker | null;
   workerUrl: URL;
   sharedInputBytes: number;
@@ -71,7 +67,6 @@ type WorkerMessages =
   | { type: "clipboard-paste"; msgid: number }
   | { type: "start-error"; message?: string }
   | { type: "stderr"; message?: string }
-  | { type: "start-debug"; message: string }
   | { type: "exit"; code: number; lastStderr?: string };
 
 const DEFAULT_SEED = [
@@ -173,6 +168,8 @@ return get_selections(...)
 export class MonacoNeovimClient {
   private readonly editor: MonacoEditor.IStandaloneCodeEditor;
   private readonly opts: MonacoNeovimResolvedOptions;
+  private readonly wasmPath = defaultWasmPath;
+  private readonly runtimePath = defaultRuntimePath;
   private worker: Worker | null = null;
   private reqId = 1;
   private workerExited = false;
@@ -195,14 +192,11 @@ export class MonacoNeovimClient {
   private lastCursorWidth: number | null = null;
   private initialCursorWidth = 0;
   private typicalFullWidth = 2;
-  private inputDebugCount = 0;
   private nextSeedLines: string[] | null = null;
 
   constructor(editor: MonacoEditor.IStandaloneCodeEditor, options: MonacoNeovimOptions = {}) {
     this.editor = editor;
     this.opts = {
-      wasmPath: options.wasmPath ?? defaultWasmPath,
-      runtimePath: options.runtimePath ?? defaultRuntimePath,
       worker: options.worker ?? null,
       workerUrl: options.workerUrl ?? new URL("./nvimWorker.ts", import.meta.url),
       sharedInputBytes: options.sharedInputBytes ?? DEFAULT_SHARED_INPUT_BYTES,
@@ -236,8 +230,8 @@ export class MonacoNeovimClient {
       type: "start",
       cols: this.opts.cols,
       rows: this.opts.rows,
-      wasmPath: this.opts.wasmPath,
-      runtimePath: this.opts.runtimePath,
+      wasmPath: this.wasmPath,
+      runtimePath: this.runtimePath,
       inputBuffer: this.sharedInput?.buffer,
     };
     const transfers: Transferable[] = [];
@@ -248,8 +242,8 @@ export class MonacoNeovimClient {
         type: "start",
         cols: this.opts.cols,
         rows: this.opts.rows,
-        wasmPath: this.opts.wasmPath,
-        runtimePath: this.opts.runtimePath,
+        wasmPath: this.wasmPath,
+        runtimePath: this.runtimePath,
         inputBuffer: this.sharedInput?.buffer,
       });
     }
@@ -272,7 +266,6 @@ export class MonacoNeovimClient {
     this.bufHandle = null;
     this.primeSent = false;
     this.visualSelectionActive = false;
-    this.inputDebugCount = 0;
     if (this.cursorRefreshTimer) {
       clearTimeout(this.cursorRefreshTimer);
       this.cursorRefreshTimer = null;
@@ -370,13 +363,6 @@ export class MonacoNeovimClient {
     } else if (type === "rpc-notify") {
       const { method, params } = message as RpcNotify;
       void this.handleNotify(method, params ?? []);
-    } else if (type === "start-debug") {
-      const payload = message as { message?: string };
-      const text = payload?.message;
-      if (text) {
-        // eslint-disable-next-line no-console
-        console.warn("[nvim start]", text);
-      }
     } else if (type === "rpc-request") {
       const { msgid, method, params } = message as RpcRequest;
       this.handleRequest(msgid, method, params ?? []);
@@ -454,12 +440,6 @@ export class MonacoNeovimClient {
     const key = translateKey(ev.browserEvent as KeyboardEvent);
     if (!key) return;
     ev.preventDefault();
-    // Debug: log a few key events to confirm UI->worker flow.
-    if (this.inputDebugCount < 5) {
-      // eslint-disable-next-line no-console
-      console.warn("[nvim input] key", key);
-      this.inputDebugCount += 1;
-    }
     this.sendInput(key);
   }
 

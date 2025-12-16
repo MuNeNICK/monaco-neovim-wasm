@@ -1,15 +1,9 @@
 import * as monaco from "monaco-editor";
 import "monaco-editor/min/vs/editor/editor.main.css";
-import { createMonacoNeovim } from "../src";
-// Bundle-safe editor worker for Vite
-// eslint-disable-next-line import/no-unresolved
+import { createMonacoNeovim } from "monaco-neovim-wasm";
 import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker&url";
 
-// Ensure Monaco knows how to load its own worker when running under Vite.
-// This keeps Monaco warnings out of the console and prevents main-thread fallback.
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore
-self.MonacoEnvironment = {
+(self as any).MonacoEnvironment = {
   getWorker: () => new Worker(editorWorker, { type: "module" }),
   getWorkerUrl: () => editorWorker as string,
 };
@@ -49,10 +43,8 @@ editor.onDidChangeModelContent(() => {
 });
 
 const client = createMonacoNeovim(editor, {
-  wasmPath: "/nvim.wasm",
-  runtimePath: "/nvim-runtime.tar.gz",
-  status: (text, warn) => setStatus(text, !!warn),
-  onModeChange: (mode) => { modeEl.textContent = `mode: ${mode}`; },
+  status: (text: string, warn?: boolean) => setStatus(text, !!warn),
+  onModeChange: (mode: string) => { modeEl.textContent = `mode: ${mode}`; },
 });
 
 let starting = false;
@@ -106,7 +98,6 @@ function setStatus(text: string, warn = false) {
   statusEl.className = warn ? "warn" : "ok";
 }
 
-// Auto-start with no extra chrome.
 if (sabReady) void start();
 
 function toggleVim() {
@@ -121,5 +112,4 @@ function toggleVim() {
 
 toggleBtn?.addEventListener("click", () => toggleVim());
 
-// @ts-expect-error for quick fiddling in the console
-window.nvimClient = client;
+(window as any).nvimClient = client;

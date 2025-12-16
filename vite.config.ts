@@ -1,21 +1,9 @@
 import { defineConfig } from "vite";
 
-const crossOriginHeaders = {
-  "Cross-Origin-Opener-Policy": "same-origin",
-  "Cross-Origin-Embedder-Policy": "require-corp",
-};
-
 export default defineConfig({
-  server: {
-    port: 8080,
-    headers: crossOriginHeaders,
-  },
-  preview: {
-    port: 8080,
-    headers: crossOriginHeaders,
-  },
   build: {
     target: "esnext",
+    emptyOutDir: false,
     lib: {
       entry: "src/index.ts",
       name: "monacoNeovimWasm",
