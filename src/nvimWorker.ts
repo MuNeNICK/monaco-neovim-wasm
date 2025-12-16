@@ -99,16 +99,22 @@ class RingFd extends Fd {
   fd_read(size: number) {
     const max = Math.min(Math.max(0, Number(size) || 0), this.capacity);
     if (max === 0) return { ret: wasi.ERRNO_AGAIN, data: new Uint8Array() };
-    let head = Atomics.load(this.ctrl, 0);
-    const tail = Atomics.load(this.ctrl, 1);
-    if (head === tail) return { ret: wasi.ERRNO_AGAIN, data: new Uint8Array() };
     const out = new Uint8Array(max);
     let written = 0;
-    while (head !== tail && written < max) {
-      out[written++] = this.data[head];
-      head = (head + 1) % this.capacity;
+    while (written === 0) {
+      let head = Atomics.load(this.ctrl, 0);
+      const tail = Atomics.load(this.ctrl, 1);
+      if (head === tail) {
+        if (typeof Atomics.wait !== "function") return { ret: wasi.ERRNO_AGAIN, data: new Uint8Array() };
+        Atomics.wait(this.ctrl, 1, tail, 1000);
+        continue;
+      }
+      while (head !== tail && written < max) {
+        out[written++] = this.data[head];
+        head = (head + 1) % this.capacity;
+      }
+      Atomics.store(this.ctrl, 0, head);
     }
-    Atomics.store(this.ctrl, 0, head);
     return { ret: wasi.ERRNO_SUCCESS, data: out.slice(0, written) };
   }
 

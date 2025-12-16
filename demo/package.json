@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "monaco-editor": "^0.44.0",
-    "monaco-neovim-wasm": "^0.1.0"
+    "monaco-neovim-wasm": "^0.1.1"
   },
   "devDependencies": {
     "typescript": "^5.4.0",
