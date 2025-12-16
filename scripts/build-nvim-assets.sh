@@ -78,7 +78,7 @@ PATH="$HOST_DEPS_PREFIX/bin:$PATH" \
 
 # Safety net: ensure host lua/luac exist where the Makefile expects them.
 if [ ! -x "$HOST_LUA_PRG" ]; then
-  found_lua="$(find "$HOST_DEPS_DIR" -path '*/bin/lua' -type f -print -quit || true)"
+  found_lua="$(find "$HOST_BUILD_DIR" -path '*/bin/lua' -o -name 'lua' -type f -print -quit || true)"
   if [ -n "$found_lua" ]; then
     mkdir -p "$(dirname "$HOST_LUA_PRG")"
     cp "$found_lua" "$HOST_LUA_PRG"
@@ -89,7 +89,7 @@ if [ ! -x "$HOST_LUA_PRG" ]; then
   fi
 fi
 if [ ! -x "$HOST_LUAC" ]; then
-  found_luac="$(find "$HOST_DEPS_DIR" -path '*/bin/luac' -type f -print -quit || true)"
+  found_luac="$(find "$HOST_BUILD_DIR" -path '*/bin/luac' -o -name 'luac' -type f -print -quit || true)"
   if [ -n "$found_luac" ]; then
     mkdir -p "$(dirname "$HOST_LUAC")"
     cp "$found_luac" "$HOST_LUAC"
@@ -112,6 +112,13 @@ PATH="$HOST_DEPS_PREFIX/bin:$PATH" HOST_LUA_PRG="$HOST_LUA_PRG" HOST_LUAC="$HOST
 # so host_lua_gen.py uses the native lib instead of the wasm one.
 if [ ! -f "$HOST_BUILD_DIR/libnlua0-host.so" ] && [ -f "$HOST_BUILD_DIR/lib/libnlua0.so" ]; then
   cp "$HOST_BUILD_DIR/lib/libnlua0.so" "$HOST_BUILD_DIR/libnlua0-host.so"
+fi
+# Capture host nlua if placed elsewhere.
+if [ ! -f "$HOST_BUILD_DIR/libnlua0-host.so" ]; then
+  found_nlua="$(find "$HOST_BUILD_DIR" -name 'libnlua0*.so' -type f -print -quit || true)"
+  if [ -n "$found_nlua" ]; then
+    cp "$found_nlua" "$HOST_BUILD_DIR/libnlua0-host.so"
+  fi
 fi
 for dir in $OUT_DIRS; do
   cp build-wasm/bin/nvim "$ROOT_DIR/$dir/nvim.wasm"
