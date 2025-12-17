@@ -121,7 +121,8 @@ end
 local function get_selections(win)
   win = win or api.nvim_get_current_win()
   local buf = api.nvim_win_get_buf(win)
-  local mode = api.nvim_get_mode().mode or ""
+  local full_mode = api.nvim_get_mode().mode or ""
+  local mode = full_mode:sub(-1)
   local is_visual = mode:match("[vV\\22sS\\19]")
 
   if not is_visual then
@@ -136,7 +137,7 @@ local function get_selections(win)
   local eline = fn.line('.') - 1
   local ecol = fn.col('.') - 1
 
-  if mode:lower() == "v" then
+  if mode == "v" or mode == "V" then
     local start_left = true
     if sline > eline or (sline == eline and scol > ecol) then
       start_left = false
@@ -204,6 +205,9 @@ export class MonacoNeovimClient {
   private lastMode = "";
   private visualSelectionToken = 0;
   private visualSelectionActive = false;
+  private visualDecorationIds: string[] = [];
+  private visualStyleEl: HTMLStyleElement | null = null;
+  private visualBgCss = "rgba(62, 68, 81, 0.45)";
   private cursorRefreshTimer: number | null = null;
   private cursorRefreshInFlight = false;
   private cursorRefreshPending = false;
@@ -564,6 +568,11 @@ export class MonacoNeovimClient {
   private disposeEditorListeners(): void {
     this.disposables.forEach((d) => d.dispose());
     this.disposables = [];
+    this.clearVisualDecorations();
+    if (this.visualStyleEl) {
+      try { this.visualStyleEl.remove(); } catch (_) {}
+      this.visualStyleEl = null;
+    }
     if (this.cmdlineEl) {
       try { this.cmdlineEl.remove(); } catch (_) {}
       this.cmdlineEl = null;
@@ -596,6 +605,7 @@ export class MonacoNeovimClient {
     this.shadowLines = null;
     this.pendingBufEdits = [];
     this.pendingCursorSync = false;
+    this.pendingFullSync = false;
     if (this.cursorSyncTimer) {
       clearTimeout(this.cursorSyncTimer);
       this.cursorSyncTimer = null;
@@ -1175,6 +1185,87 @@ export class MonacoNeovimClient {
     }
   }
 
+  private ensureVisualStyle(): void {
+    if (this.visualStyleEl) return;
+    const el = document.createElement("style");
+    el.id = "monaco-neovim-wasm-visual-style";
+    el.textContent = `
+.monaco-neovim-visual-line {
+  background-color: ${this.visualBgCss};
+}
+.monaco-neovim-visual-inline {
+  background-color: ${this.visualBgCss};
+}
+`;
+    document.head.appendChild(el);
+    this.visualStyleEl = el;
+  }
+
+  private setVisualBgCss(bg: string): void {
+    const next = bg || this.visualBgCss;
+    if (next === this.visualBgCss && this.visualStyleEl) return;
+    this.visualBgCss = next;
+    if (this.visualStyleEl) {
+      this.visualStyleEl.textContent = `
+.monaco-neovim-visual-line {
+  background-color: ${this.visualBgCss};
+}
+.monaco-neovim-visual-inline {
+  background-color: ${this.visualBgCss};
+}
+`;
+    }
+  }
+
+  private clearVisualDecorations(): void {
+    if (!this.visualDecorationIds.length) return;
+    try {
+      this.visualDecorationIds = this.editor.deltaDecorations(this.visualDecorationIds, []);
+    } catch (_) {
+      this.visualDecorationIds = [];
+    }
+    this.visualSelectionActive = false;
+  }
+
+  private applyVisualDecorations(selections: monaco.Selection[], mode: string): void {
+    this.ensureVisualStyle();
+    const tail = getModeTail(mode);
+    const isLinewise = tail === "V";
+    const decorations: monaco.editor.IModelDeltaDecoration[] = [];
+    if (isLinewise) {
+      let minLine = Infinity;
+      let maxLine = -Infinity;
+      for (const sel of selections) {
+        const a = sel.getStartPosition();
+        const b = sel.getEndPosition();
+        minLine = Math.min(minLine, a.lineNumber, b.lineNumber);
+        maxLine = Math.max(maxLine, a.lineNumber, b.lineNumber);
+      }
+      if (Number.isFinite(minLine) && Number.isFinite(maxLine) && maxLine >= minLine) {
+        decorations.push({
+          range: new monaco.Range(minLine, 1, maxLine, 1),
+          options: { isWholeLine: true, className: "monaco-neovim-visual-line" },
+        });
+      }
+    } else {
+      for (const sel of selections) {
+        const a = sel.getStartPosition();
+        const b = sel.getEndPosition();
+        decorations.push({
+          range: monaco.Range.fromPositions(a, b),
+          options: { inlineClassName: "monaco-neovim-visual-inline" },
+        });
+      }
+    }
+    try {
+      this.visualDecorationIds = this.editor.deltaDecorations(this.visualDecorationIds, decorations);
+      this.visualSelectionActive = decorations.length > 0;
+    } catch (_) {
+      this.visualDecorationIds = [];
+      this.visualSelectionActive = false;
+    }
+  }
+
   private applyNvimMode(mode: string): void {
     const m = typeof mode === "string" ? mode : "";
     if (!m || m === this.lastMode) return;
@@ -1419,6 +1510,10 @@ api.nvim_create_autocmd({ "ModeChanged", "InsertEnter", "InsertLeave" }, {
   group = group,
   callback = function() send_mode(); send_cursor() end,
 })
+api.nvim_create_autocmd({ "VisualEnter", "VisualLeave" }, {
+  group = group,
+  callback = function() send_mode(); send_cursor() end,
+})
 
 send_mode()
 send_cursor()
@@ -1545,15 +1640,16 @@ send_cursor()
       : new monaco.Position(ln, cl);
     this.lastCursorPos = validated;
     if (this.compositionActive) return;
-    if (!this.visualSelectionActive) {
-      const current = this.editor.getPosition();
-      const same = current && current.lineNumber === validated.lineNumber && current.column === validated.column;
-      if (!same) {
-        this.suppressCursorSync = true;
-        this.editor.setPosition(this.lastCursorPos);
-        this.editor.revealPositionInCenterIfOutsideViewport(this.lastCursorPos);
-        this.suppressCursorSync = false;
+    const current = this.editor.getPosition();
+    const same = current && current.lineNumber === validated.lineNumber && current.column === validated.column;
+    if (!same) {
+      this.suppressCursorSync = true;
+      this.editor.setPosition(this.lastCursorPos);
+      if (this.visualSelectionActive) {
+        this.editor.setSelection(new monaco.Selection(validated.lineNumber, validated.column, validated.lineNumber, validated.column));
       }
+      this.editor.revealPositionInCenterIfOutsideViewport(this.lastCursorPos);
+      this.suppressCursorSync = false;
     }
   }
 
@@ -1650,20 +1746,14 @@ send_cursor()
     const visual = isVisualMode(mode);
     const token = ++this.visualSelectionToken;
     if (!visual) {
-      if (this.visualSelectionActive) {
-        const pos = this.editor.getPosition() || this.lastCursorPos || new monaco.Position(1, 1);
-        this.editor.setSelection(new monaco.Selection(pos.lineNumber, pos.column, pos.lineNumber, pos.column));
-        this.visualSelectionActive = false;
-      }
+      this.clearVisualDecorations();
       return;
     }
     try {
       const selections = await this.fetchVisualRanges();
       if (token !== this.visualSelectionToken) return;
       if (!selections.length) return;
-      if (selections.length === 1) this.editor.setSelection(selections[0]);
-      else this.editor.setSelections(selections);
-      this.visualSelectionActive = true;
+      this.applyVisualDecorations(selections, mode);
     } catch (_) {
     }
   }
@@ -1693,6 +1783,7 @@ send_cursor()
         },
       });
       this.editor.updateOptions({ theme: this.opts.visualThemeName });
+      this.setVisualBgCss(main);
     } catch (_) {
     }
   }
@@ -1931,8 +2022,10 @@ function toMonacoBytePos(
   let endByte = byte;
   if (inclusiveEnd) {
     const charIndex = byteIndexToCharIndex(text, byte);
-    const cp = text.codePointAt(charIndex);
-    endByte = byte + utf8ByteLength(cp || 0);
+    if (charIndex < text.length) {
+      const cp = text.codePointAt(charIndex);
+      endByte = byte + utf8ByteLength(cp ?? 0);
+    }
   }
   const column = byteIndexToCharIndex(text, endByte) + 1;
   const maxColumn = model.getLineMaxColumn(lineNumber);
@@ -1941,7 +2034,7 @@ function toMonacoBytePos(
 
 function isVisualMode(mode: string): boolean {
   const m = typeof mode === "string" ? mode : "";
-  return m.startsWith("v") || m.startsWith("V") || m === "\u0016" || m.startsWith("s") || m.startsWith("S") || m === "\u0013";
+  return m.includes("v") || m.includes("V") || m.includes("\u0016") || m.includes("s") || m.includes("S") || m.includes("\u0013");
 }
 
 function withAlpha(hex: string, alpha: number): string {
@@ -1985,6 +2078,11 @@ function domListener<E extends Event>(
 function isInsertLike(mode: string): boolean {
   const m = typeof mode === "string" ? mode : "";
   return m.startsWith("i") || m.startsWith("R");
+}
+
+function getModeTail(mode: string): string {
+  const m = typeof mode === "string" ? mode : "";
+  return m.length ? m[m.length - 1] : "";
 }
 
 function applyShadowLinesChange(
