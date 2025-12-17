@@ -14,6 +14,7 @@ export const defaultRuntimePath = new URL("./nvim-runtime.tar.gz", import.meta.u
 export function createMonacoNeovim(editor, options = {}) {
   return createMonacoNeovimBase(editor, {
     ...options,
+    searchHighlights: options.searchHighlights ?? true,
     inputMode: options.inputMode ?? "message",
     workerUrl: options.workerUrl ?? defaultWorkerUrlAsyncify,
     wasmPath: options.wasmPath ?? defaultWasmPath,

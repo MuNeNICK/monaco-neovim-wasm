@@ -14,10 +14,10 @@ export const defaultRuntimePath = new URL("./nvim-runtime.tar.gz", import.meta.u
 export function createMonacoNeovim(editor, options = {}) {
   return createMonacoNeovimBase(editor, {
     ...options,
+    searchHighlights: options.searchHighlights ?? true,
     inputMode: options.inputMode ?? "shared",
     workerUrl: options.workerUrl ?? defaultWorkerUrl,
     wasmPath: options.wasmPath ?? defaultWasmPath,
     runtimePath: options.runtimePath ?? defaultRuntimePath,
   });
 }
-

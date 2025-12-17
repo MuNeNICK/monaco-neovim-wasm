@@ -1,18 +1,17 @@
 {
   "name": "monaco-neovim-wasm-workspace",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "private": true,
   "type": "module",
   "description": "Workspace for @monaco-neovim-wasm/* packages.",
   "workspaces": [
-    "packages/*",
-    "demo"
+    "packages/*"
   ],
   "scripts": {
     "build:assets": "bash ./scripts/build-nvim-assets.sh",
-    "build": "npm -w @monaco-neovim-wasm/lib run build && npm -w monaco-neovim-wasm-demo run build",
+    "build": "npm -w @monaco-neovim-wasm/lib run build",
     "build:all": "npm run build:assets && npm run build",
-    "typecheck": "npm -w @monaco-neovim-wasm/lib run typecheck && npm -w monaco-neovim-wasm-demo run typecheck",
+    "typecheck": "npm -w @monaco-neovim-wasm/lib run typecheck",
     "build:types": "npm -w @monaco-neovim-wasm/lib run build:types"
   },
   "devDependencies": {
