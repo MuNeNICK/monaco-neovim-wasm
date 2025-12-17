@@ -1,16 +1,17 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
+    "target": "ESNext",
     "module": "ESNext",
-    "lib": ["ES2022", "DOM", "DOM.Iterable", "WebWorker"],
     "moduleResolution": "Bundler",
-    "types": ["vite/client"],
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
     "strict": true,
-    "noEmit": true,
     "skipLibCheck": true,
+    "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
     "resolveJsonModule": true,
-    "isolatedModules": true
+    "types": [],
+    "baseUrl": "."
   },
   "include": ["src"]
 }
+

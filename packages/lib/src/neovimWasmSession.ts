@@ -12,11 +12,14 @@ export type NeovimWasmSessionHandlers = {
   onWarning?: (message: string) => void;
 };
 
+export type NeovimWasmInputMode = "shared" | "message";
+
 export type NeovimWasmSessionInit = {
   worker?: Worker | null;
   workerUrl?: URL;
   createWorker?: (() => Worker) | null;
   sharedInputBytes?: number;
+  inputMode?: NeovimWasmInputMode;
   rpcTimeoutMs?: number;
   maxQueuedBytes?: number;
   reuseWorker?: boolean;
@@ -30,6 +33,7 @@ export type NeovimWasmSessionStartOptions = {
   runtimePath: string;
   env?: Record<string, string>;
   files?: Array<{ path: string; data: Uint8Array }>;
+  inputMode?: NeovimWasmInputMode;
 };
 
 type PendingEntry = {
@@ -88,6 +92,7 @@ export class NeovimWasmSession {
 
   private worker: Worker | null = null;
   private sharedInput: SharedInputRing | null = null;
+  private inputMode: NeovimWasmInputMode = "shared";
   private reqId = 1;
   private readonly pending = new Map<number, PendingEntry>();
   private workerExited = false;
@@ -103,6 +108,7 @@ export class NeovimWasmSession {
       workerUrl: init.workerUrl ?? null,
       createWorker: init.createWorker ?? null,
       sharedInputBytes: init.sharedInputBytes ?? DEFAULT_SHARED_INPUT_BYTES,
+      inputMode: init.inputMode ?? "shared",
       rpcTimeoutMs: init.rpcTimeoutMs ?? 8000,
       maxQueuedBytes: init.maxQueuedBytes ?? (4 * 1024 * 1024),
       reuseWorker: init.reuseWorker ?? false,
@@ -124,14 +130,15 @@ export class NeovimWasmSession {
 
   async start(options: NeovimWasmSessionStartOptions): Promise<void> {
     const { cols, rows, wasmPath, runtimePath, env, files } = options;
-    if (!isSharedArrayBufferAvailable()) {
-      throw new Error("SharedArrayBuffer is required; serve with COOP/COEP so crossOriginIsolated is true.");
+    this.inputMode = options.inputMode ?? this.init.inputMode;
+    if (this.inputMode === "shared" && !isSharedArrayBufferAvailable()) {
+      throw new Error("SharedArrayBuffer is required for inputMode=\"shared\"; serve with COOP/COEP so crossOriginIsolated is true, or use inputMode=\"message\" with the asyncify worker.");
     }
 
     const prevWorker = this.worker;
     this.stop({ terminate: !this.init.reuseWorker, silent: true });
 
-    this.sharedInput = createSharedInputRing(this.init.sharedInputBytes);
+    this.sharedInput = this.inputMode === "shared" ? createSharedInputRing(this.init.sharedInputBytes) : null;
     this.workerExited = false;
     this.workerExitCode = null;
     this.reqId = 1;
@@ -155,7 +162,7 @@ export class NeovimWasmSession {
       rows: Number(rows) || 24,
       wasmPath: String(wasmPath ?? ""),
       runtimePath: String(runtimePath ?? ""),
-      inputBuffer: this.sharedInput.buffer,
+      inputBuffer: this.sharedInput?.buffer ?? null,
       env: env ?? undefined,
       files: files ?? undefined,
     };
@@ -312,20 +319,25 @@ export class NeovimWasmSession {
   private postInput(data: Uint8Array): void {
     if (!data || !data.buffer) return;
     const payload = normalizeTransfer(data);
-    if (!this.sharedInput) return;
-    if (this.inputQueueHead >= this.inputQueue.length) {
-      const ok = this.sharedInput.push(payload);
-      if (ok) return;
+    if (!this.worker || this.workerExited) return;
+    if (this.inputMode === "shared") {
+      if (!this.sharedInput) return;
+      if (this.inputQueueHead >= this.inputQueue.length) {
+        const ok = this.sharedInput.push(payload);
+        if (ok) return;
+      }
+      this.enqueueInput(payload);
+      return;
     }
     this.enqueueInput(payload);
   }
 
   private enqueueInput(payload: Uint8Array): void {
-    if (!this.sharedInput) return;
+    if (!this.worker || this.workerExited) return;
     this.inputQueue.push(payload);
     this.inputQueuedBytes += payload.byteLength;
     if (this.inputQueuedBytes > this.init.maxQueuedBytes) {
-      try { this.init.handlers.onWarning?.("input queue overflow (ring buffer too small); dropping queued input"); } catch (_) {}
+      try { this.init.handlers.onWarning?.("input queue overflow; dropping queued input"); } catch (_) {}
       this.inputQueue = [];
       this.inputQueueHead = 0;
       this.inputQueuedBytes = 0;
@@ -343,14 +355,42 @@ export class NeovimWasmSession {
   }
 
   private flushInputQueue(): void {
-    if (!this.sharedInput || this.inputQueueHead >= this.inputQueue.length) return;
-    while (this.inputQueueHead < this.inputQueue.length) {
-      const next = this.inputQueue[this.inputQueueHead];
-      const ok = this.sharedInput.push(next);
-      if (!ok) break;
-      this.inputQueueHead += 1;
-      this.inputQueuedBytes -= next.byteLength;
+    if (this.inputQueueHead >= this.inputQueue.length) return;
+    if (!this.worker || this.workerExited) return;
+
+    if (this.inputMode === "shared") {
+      if (!this.sharedInput) return;
+      while (this.inputQueueHead < this.inputQueue.length) {
+        const next = this.inputQueue[this.inputQueueHead];
+        const ok = this.sharedInput.push(next);
+        if (!ok) break;
+        this.inputQueueHead += 1;
+        this.inputQueuedBytes -= next.byteLength;
+      }
+    } else {
+      const maxBatch = 256 * 1024;
+      let bytes = 0;
+      let count = 0;
+      for (let i = this.inputQueueHead; i < this.inputQueue.length; i += 1) {
+        const next = this.inputQueue[i];
+        if (!next?.byteLength) continue;
+        if (count > 0 && bytes + next.byteLength > maxBatch) break;
+        bytes += next.byteLength;
+        count += 1;
+      }
+      if (count <= 0 || bytes <= 0) return;
+      const merged = new Uint8Array(bytes);
+      let offset = 0;
+      for (let i = 0; i < count; i += 1) {
+        const next = this.inputQueue[this.inputQueueHead + i];
+        merged.set(next, offset);
+        offset += next.byteLength;
+      }
+      this.inputQueueHead += count;
+      this.inputQueuedBytes -= bytes;
+      this.postStdin(merged);
     }
+
     if (this.inputQueueHead > 64 && this.inputQueueHead > (this.inputQueue.length / 2)) {
       this.inputQueue = this.inputQueue.slice(this.inputQueueHead);
       this.inputQueueHead = 0;
@@ -359,10 +399,19 @@ export class NeovimWasmSession {
       this.inputFlushTimer = window.setTimeout(() => {
         this.inputFlushTimer = null;
         this.flushInputQueue();
-      }, 2);
+      }, this.inputMode === "shared" ? 2 : 0);
     } else {
       this.inputQueue = [];
       this.inputQueueHead = 0;
+    }
+  }
+
+  private postStdin(chunk: Uint8Array): void {
+    if (!this.worker || this.workerExited) return;
+    try {
+      this.worker.postMessage({ type: "stdin", chunk }, [chunk.buffer]);
+    } catch (_) {
+      this.worker.postMessage({ type: "stdin", chunk });
     }
   }
 }

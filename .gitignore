@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .npm/
+packages/*/dist/
 .DS_Store
 npm-debug.log
 pnpm-debug.log
@@ -9,6 +10,10 @@ pnpm-debug.log
 # Generated WASM assets
 public/nvim.wasm
 public/nvim-runtime.tar.gz
+packages/wasm/nvim.wasm
+packages/wasm/nvim-runtime.tar.gz
+packages/wasm-async/nvim-asyncify.wasm
+packages/wasm-async/nvim-runtime.tar.gz
 
 # Submodule build outputs
 nvim-wasm/build-*/

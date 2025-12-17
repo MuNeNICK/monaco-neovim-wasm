@@ -1,6 +1,6 @@
 import * as monaco from "monaco-editor";
 import "monaco-editor/min/vs/editor/editor.main.css";
-import { createMonacoNeovim } from "monaco-neovim-wasm";
+import { createMonacoNeovim } from "@monaco-neovim-wasm/wasm-async";
 import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker&url";
 
 (self as any).MonacoEnvironment = {
@@ -50,21 +50,11 @@ const client = createMonacoNeovim(editor, {
 let starting = false;
 let vimEnabled = true;
 let cachedLines: string[] | null = null;
-const sabReady = typeof SharedArrayBuffer !== "undefined" && typeof crossOriginIsolated !== "undefined" && crossOriginIsolated;
-
-if (!sabReady) {
-  setStatus("SharedArrayBuffer unavailable; enable COOP/COEP.", true);
-}
 
 async function start() {
   if (starting) return;
   if (!vimEnabled) return;
   starting = true;
-  if (!sabReady) {
-    setStatus("SharedArrayBuffer unavailable; enable COOP/COEP.", true);
-    starting = false;
-    return;
-  }
   setStatus("starting...");
   try {
     const seed = (cachedLines && cachedLines.some((l) => l.length > 0))
@@ -98,7 +88,7 @@ function setStatus(text: string, warn = false) {
   statusEl.className = warn ? "warn" : "ok";
 }
 
-if (sabReady) void start();
+void start();
 
 function toggleVim() {
   vimEnabled = !vimEnabled;

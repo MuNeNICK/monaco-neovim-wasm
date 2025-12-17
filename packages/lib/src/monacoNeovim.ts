@@ -1,8 +1,7 @@
 import * as monaco from "monaco-editor";
 import type { editor as MonacoEditor } from "monaco-editor";
 import { DEFAULT_SHARED_INPUT_BYTES } from "./sharedInput";
-import { defaultRuntimePath, defaultWasmPath } from "./paths";
-import { NeovimWasmSession } from "./neovimWasmSession";
+import { NeovimWasmSession, type NeovimWasmInputMode } from "./neovimWasmSession";
 import motionOverridesVim from "./overrides/motion.vim?raw";
 import scrollingOverridesVim from "./overrides/scrolling.vim?raw";
 import hostCommandsOverridesVim from "./overrides/host-commands.vim?raw";
@@ -31,6 +30,7 @@ export type MonacoNeovimOptions = {
   reuseWorker?: boolean;
   wasmPath?: string;
   runtimePath?: string;
+  inputMode?: NeovimWasmInputMode;
   env?: Record<string, string>;
   files?: Array<{ path: string; data: Uint8Array | string }>;
   sharedInputBytes?: number;
@@ -94,6 +94,7 @@ type MonacoNeovimResolvedOptions = {
   reuseWorker: boolean;
   wasmPath: string;
   runtimePath: string;
+  inputMode: NeovimWasmInputMode;
   env?: Record<string, string>;
   files?: Array<{ path: string; data: Uint8Array | string }>;
   sharedInputBytes: number;
@@ -433,8 +434,9 @@ export class MonacoNeovimClient {
       worker: options.worker ?? null,
       workerUrl: options.workerUrl ?? new URL("./nvimWorker.js", import.meta.url),
       reuseWorker: options.reuseWorker ?? false,
-      wasmPath: options.wasmPath ?? defaultWasmPath,
-      runtimePath: options.runtimePath ?? defaultRuntimePath,
+      wasmPath: options.wasmPath ?? "",
+      runtimePath: options.runtimePath ?? "",
+      inputMode: options.inputMode ?? "shared",
       env: options.env,
       files: options.files,
       sharedInputBytes: options.sharedInputBytes ?? DEFAULT_SHARED_INPUT_BYTES,
@@ -543,6 +545,7 @@ export class MonacoNeovimClient {
         this.session = new NeovimWasmSession({
           worker: this.opts.worker,
           workerUrl: this.opts.workerUrl,
+          inputMode: this.opts.inputMode,
           sharedInputBytes: this.opts.sharedInputBytes,
           rpcTimeoutMs: this.opts.rpcTimeoutMs,
           reuseWorker: this.opts.reuseWorker,
@@ -551,11 +554,16 @@ export class MonacoNeovimClient {
       } else {
         this.session.setHandlers(handlers);
       }
+
+      if (!this.opts.wasmPath || !this.opts.runtimePath) {
+        throw new Error("wasmPath/runtimePath is required (use @monaco-neovim-wasm/wasm or @monaco-neovim-wasm/wasm-async for defaults).");
+      }
       await this.session.start({
         cols: this.uiCols,
         rows: this.uiRows,
         wasmPath: this.opts.wasmPath,
         runtimePath: this.opts.runtimePath,
+        inputMode: this.opts.inputMode,
         env: this.opts.env,
         files: normalizeSessionFiles(mergeSessionFiles(
           this.opts.files,

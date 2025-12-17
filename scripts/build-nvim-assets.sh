@@ -2,14 +2,16 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT_DIRS="${OUT_DIRS:-public dist}"
+OUT_DIR_WASM="${OUT_DIR_WASM:-$ROOT_DIR/packages/wasm}"
+OUT_DIR_ASYNC="${OUT_DIR_ASYNC:-$ROOT_DIR/packages/wasm-async}"
+OUT_DIRS_EXTRA="${OUT_DIRS_EXTRA:-${OUT_DIRS:-}}"
 NVIM_WASM_DIR="${NVIM_WASM_DIR:-$ROOT_DIR/nvim-wasm}"
 if [[ "$NVIM_WASM_DIR" != /* ]]; then
   NVIM_WASM_DIR="$ROOT_DIR/$NVIM_WASM_DIR"
 fi
 
 if [ -n "${OUT_DIR:-}" ]; then
-  OUT_DIRS="$OUT_DIR"
+  OUT_DIRS_EXTRA="$OUT_DIR"
 fi
 
 if [ ! -d "$NVIM_WASM_DIR" ]; then
@@ -30,9 +32,12 @@ if [ ! -d "$NVIM_WASM_DIR/neovim" ]; then
   git -C "$NVIM_WASM_DIR" submodule update --init --recursive
 fi
 
-for dir in $OUT_DIRS; do
-  mkdir -p "$ROOT_DIR/$dir"
-done
+mkdir -p "$OUT_DIR_WASM" "$OUT_DIR_ASYNC"
+if [ -n "$OUT_DIRS_EXTRA" ]; then
+  for dir in $OUT_DIRS_EXTRA; do
+    mkdir -p "$ROOT_DIR/$dir"
+  done
+fi
 
 pushd "$NVIM_WASM_DIR" >/dev/null
 mkdir -p "$TOOLCHAINS_DIR"
@@ -97,16 +102,41 @@ PATH="$HOST_DEPS_PREFIX/bin:$PATH" \
   PKG_CONFIG_PATH="$HOST_DEPS_PREFIX/lib/pkgconfig" \
   HOST_LUA_PRG="$HOST_LUA_PRG" HOST_LUAC="$HOST_LUAC" HOST_NLUA0="$HOST_NLUA0" make wasm
 
-for dir in $OUT_DIRS; do
-  cp build-wasm/bin/nvim "$ROOT_DIR/$dir/nvim.wasm"
-  tar -czf "$ROOT_DIR/$dir/nvim-runtime.tar.gz" \
-    -C "$NVIM_WASM_DIR/neovim" runtime \
-    -C "$NVIM_WASM_DIR/build-wasm" usr nvim_version.lua
-done
+PATH="$HOST_DEPS_PREFIX/bin:$PATH" \
+  CMAKE_PREFIX_PATH="$HOST_DEPS_PREFIX:$HOST_DEPS_PREFIX/lib/cmake:$HOST_DEPS_PREFIX/lib" \
+  PKG_CONFIG_PATH="$HOST_DEPS_PREFIX/lib/pkgconfig" \
+  HOST_LUA_PRG="$HOST_LUA_PRG" HOST_LUAC="$HOST_LUAC" HOST_NLUA0="$HOST_NLUA0" make wasm-asyncify
+
+cp build-wasm/bin/nvim "$OUT_DIR_WASM/nvim.wasm"
+tar -czf "$OUT_DIR_WASM/nvim-runtime.tar.gz" \
+  -C "$NVIM_WASM_DIR/neovim" runtime \
+  -C "$NVIM_WASM_DIR/build-wasm" usr nvim_version.lua
+
+cp build-wasm/bin/nvim-asyncify.wasm "$OUT_DIR_ASYNC/nvim-asyncify.wasm"
+tar -czf "$OUT_DIR_ASYNC/nvim-runtime.tar.gz" \
+  -C "$NVIM_WASM_DIR/neovim" runtime \
+  -C "$NVIM_WASM_DIR/build-wasm" usr nvim_version.lua
+
+if [ -n "$OUT_DIRS_EXTRA" ]; then
+  for dir in $OUT_DIRS_EXTRA; do
+    cp build-wasm/bin/nvim "$ROOT_DIR/$dir/nvim.wasm"
+    cp build-wasm/bin/nvim-asyncify.wasm "$ROOT_DIR/$dir/nvim-asyncify.wasm"
+    tar -czf "$ROOT_DIR/$dir/nvim-runtime.tar.gz" \
+      -C "$NVIM_WASM_DIR/neovim" runtime \
+      -C "$NVIM_WASM_DIR/build-wasm" usr nvim_version.lua
+  done
+fi
 popd >/dev/null
 
 echo "Artifacts written to:"
-for dir in $OUT_DIRS; do
-  echo " - $dir/nvim.wasm"
-  echo " - $dir/nvim-runtime.tar.gz"
-done
+echo " - $OUT_DIR_WASM/nvim.wasm"
+echo " - $OUT_DIR_WASM/nvim-runtime.tar.gz"
+echo " - $OUT_DIR_ASYNC/nvim.wasm"
+echo " - $OUT_DIR_ASYNC/nvim-runtime.tar.gz"
+if [ -n "$OUT_DIRS_EXTRA" ]; then
+  for dir in $OUT_DIRS_EXTRA; do
+    echo " - $dir/nvim.wasm"
+    echo " - $dir/nvim-asyncify.wasm"
+    echo " - $dir/nvim-runtime.tar.gz"
+  done
+fi

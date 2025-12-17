@@ -3,7 +3,7 @@ import { defineConfig } from "vite";
 export default defineConfig({
   build: {
     target: "esnext",
-    emptyOutDir: false,
+    emptyOutDir: true,
     lib: {
       entry: "src/index.ts",
       name: "monacoNeovimWasm",
@@ -18,3 +18,4 @@ export default defineConfig({
     format: "es",
   },
 });
+

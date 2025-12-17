@@ -2,16 +2,23 @@
 
 Run the actual Neovim core (WASM, headless) behind Monaco, using Neovim's native msgpack-RPC instead of a keybinding shim.
 
+## Packages
+- `@monaco-neovim-wasm/wasm`: normal build (SharedArrayBuffer; requires COOP/COEP)
+- `@monaco-neovim-wasm/wasm-async`: asyncify build (postMessage input; no COOP/COEP)
+- `@monaco-neovim-wasm/lib`: core API (bring your own `wasmPath`/`runtimePath`)
+
 ## Usage in code
 ```ts
 import * as monaco from "monaco-editor";
 import "monaco-editor/min/vs/editor/editor.main.css";
-import { createMonacoNeovim } from "monaco-neovim-wasm";
+import { createMonacoNeovim } from "@monaco-neovim-wasm/wasm";
 
 const editor = monaco.editor.create(document.getElementById("root")!, { language: "lua", readOnly: true });
 const client = createMonacoNeovim(editor, { status: (text, warn) => console.log(warn ? "WARN" : "OK", text) });
 await client.start();
 ```
+- If you cannot (or don't want to) enable COOP/COEP, use the asyncify build instead:
+  - `import { createMonacoNeovim } from "@monaco-neovim-wasm/wasm-async";`
 - `monaco-editor` is a peer dependency; install it in your app.
 - `client.stop()` tears down the worker; `client.dispose()` cleans up listeners.
 - Convenience helpers: `client.input(keys)` / `client.paste(text)` / `client.execLua(code)` / `client.command(cmd)`.
@@ -64,19 +71,27 @@ Note: Neovim is launched with `-u NORC --noplugin`, so it won’t auto-load your
 ## Session-only (non-Monaco) usage
 If you want a reusable building block for other editors (or headless automation), use `NeovimWasmSession`:
 ```ts
-import { NeovimWasmSession, defaultWorkerUrl } from "monaco-neovim-wasm";
+import { NeovimWasmSession, defaultWorkerUrl, defaultWasmPath, defaultRuntimePath } from "@monaco-neovim-wasm/wasm";
 
 const session = new NeovimWasmSession({
   workerUrl: defaultWorkerUrl,
   handlers: { onNotify: (m, p) => console.log("notify", m, p) },
 });
-await session.start({ cols: 120, rows: 40, wasmPath: "/nvim.wasm", runtimePath: "/nvim-runtime.tar.gz" });
+await session.start({ cols: 120, rows: 40, wasmPath: defaultWasmPath, runtimePath: defaultRuntimePath });
 await session.waitForApi();
 await session.call("nvim_command", ["echo 'hello'"]);
 ```
 
+Asyncify (SAB-free) session usage:
+```ts
+import { NeovimWasmSession, defaultWorkerUrlAsyncify, defaultWasmPath, defaultRuntimePath } from "@monaco-neovim-wasm/wasm-async";
+
+const session = new NeovimWasmSession({ workerUrl: defaultWorkerUrlAsyncify, inputMode: "message" });
+await session.start({ cols: 120, rows: 40, wasmPath: defaultWasmPath, runtimePath: defaultRuntimePath, inputMode: "message" });
+```
+
 ## Demo
-The demo is a separate package under `demo/` and is meant to run against the published `monaco-neovim-wasm` package.
+The demo is a separate package under `demo/` and is meant to run against the published `@monaco-neovim-wasm/*` packages.
 
 ```sh
 cd demo
@@ -88,7 +103,7 @@ Open http://localhost:8080, press `i`, type. Vim toggle is in the top bar.
 If Vite errors with `431`, clear `localhost` cookies or use http://127.0.0.1:8080.
 
 ## Build (maintainers)
-Build the bundled Neovim WASM + runtime from `./nvim-wasm` and produce `dist/` for publishing:
+Build the bundled Neovim WASM + runtime from `./nvim-wasm` and produce outputs for publishing:
 
 ```sh
 npm run build:assets
@@ -96,10 +111,13 @@ npm run build
 ```
 
 ## Cross-origin isolation
-- The transport now uses `SharedArrayBuffer` for main-thread → worker input, so pages must be `crossOriginIsolated`.
-- Serve with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` (and ensure subresources are CORP/CORS compatible). The demo's Vite dev/preview servers send these headers.
+- `@monaco-neovim-wasm/wasm` uses `SharedArrayBuffer` for main-thread → worker input, so pages must be `crossOriginIsolated` (COOP/COEP).
+- `@monaco-neovim-wasm/wasm-async` uses `postMessage` input and does not require COOP/COEP.
 - Neovim clipboard calls go through the browser Clipboard API; a prompt is used as a fallback.
-- The demo sets Neovim options for a minimal UI (`noswapfile`, `norelativenumber`, etc.) and seeds a Lua buffer; adjust in `src/monacoNeovim.ts` if needed.
+- The demo sets Neovim options for a minimal UI (`noswapfile`, `norelativenumber`, etc.) and seeds a Lua buffer; adjust in `packages/lib/src/monacoNeovim.ts` if needed.
+
+## Vite notes
+- If you use Vite, add the used packages to `optimizeDeps.exclude` (example: `@monaco-neovim-wasm/wasm-async` and `@monaco-neovim-wasm/lib`) so `import.meta.url` URLs for the worker/wasm files resolve correctly.
 
 ## Acknowledgements
 - https://github.com/brijeshb42/monaco-vim
