@@ -27,9 +27,11 @@ await client.start();
 - For scroll/reveal motions like `zt`/`zz`/`zb` (and cursor-to-screen-line `H`/`M`/`L`), set `scrollMotions: true` (delegates viewport positioning to Monaco and optionally moves cursor for `z<CR>`/`z.`/`z-`).
 
 ## Loading Vimscript overrides (vscode-neovim style)
-This package injects its host-aware mappings via `nvim_exec_lua` so it can stay a single JS dependency (no extra `.vim` files, no `runtimepath` surgery).
+This package keeps the host-aware mappings as Vimscript (like `vscode-motion.vim` / `vscode-scrolling.vim`), but still ships as a single JS dependency by embedding those `.vim` files into Neovim’s in-memory filesystem and sourcing them when needed.
 
-If you prefer to keep overrides as Vimscript files (like `vscode-motion.vim` / `vscode-scrolling.vim`), you can still do that by placing files into the in-memory FS and `:source`-ing them via startup hooks:
+Built-in overrides are mounted at `$HOME/.config/nvim/monaco-neovim-wasm/motion.vim` and `$HOME/.config/nvim/monaco-neovim-wasm/scrolling.vim`.
+
+You can also provide your own overrides by placing files into the in-memory FS and `:source`-ing them via startup hooks:
 ```ts
 const client = createMonacoNeovim(editor, {
   files: [

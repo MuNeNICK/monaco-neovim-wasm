@@ -3,6 +3,8 @@ import type { editor as MonacoEditor } from "monaco-editor";
 import { DEFAULT_SHARED_INPUT_BYTES } from "./sharedInput";
 import { defaultRuntimePath, defaultWasmPath } from "./paths";
 import { NeovimWasmSession } from "./neovimWasmSession";
+import motionOverridesVim from "./overrides/motion.vim?raw";
+import scrollingOverridesVim from "./overrides/scrolling.vim?raw";
 
 export type StatusEmitter = (text: string, warn?: boolean) => void;
 export type ClipboardAdapter = {
@@ -381,7 +383,15 @@ export class MonacoNeovimClient {
         wasmPath: this.opts.wasmPath,
         runtimePath: this.opts.runtimePath,
         env: this.opts.env,
-        files: normalizeSessionFiles(this.opts.files),
+        files: normalizeSessionFiles(mergeSessionFiles(
+          this.opts.files,
+          this.opts.wrappedLineMotions || this.opts.scrollMotions
+            ? [
+              { path: "home/.config/nvim/monaco-neovim-wasm/motion.vim", data: motionOverridesVim },
+              { path: "home/.config/nvim/monaco-neovim-wasm/scrolling.vim", data: scrollingOverridesVim },
+            ]
+            : [],
+        )),
       });
       this.opts.status("starting...");
       this.primeSent = false;
@@ -1790,61 +1800,11 @@ local function send_mode()
 end
 
 if ${wrapped} then
-  vim.keymap.set({ "n", "x", "o" }, "gj", function()
-    vim.rpcnotify(chan, "monaco_cursorMove", { to = "down", by = "wrappedLine", value = vim.v.count1 })
-  end, { silent = true })
-  vim.keymap.set({ "n", "x", "o" }, "gk", function()
-    vim.rpcnotify(chan, "monaco_cursorMove", { to = "up", by = "wrappedLine", value = vim.v.count1 })
-  end, { silent = true })
-  vim.keymap.set({ "n", "x", "o" }, "g0", function()
-    vim.rpcnotify(chan, "monaco_cursorMove", { to = "wrappedLineFirstNonWhitespaceCharacter" })
-  end, { silent = true })
-  vim.keymap.set({ "n", "x", "o" }, "g<Home>", function()
-    vim.rpcnotify(chan, "monaco_cursorMove", { to = "wrappedLineFirstNonWhitespaceCharacter" })
-  end, { silent = true })
-  vim.keymap.set({ "n", "x", "o" }, "g^", function()
-    vim.rpcnotify(chan, "monaco_cursorMove", { to = "wrappedLineFirstNonWhitespaceCharacter" })
-  end, { silent = true })
-  vim.keymap.set({ "n", "x", "o" }, "g$", function()
-    vim.rpcnotify(chan, "monaco_cursorMove", { to = "wrappedLineLastNonWhitespaceCharacter" })
-  end, { silent = true })
-  vim.keymap.set({ "n", "x", "o" }, "g<End>", function()
-    vim.rpcnotify(chan, "monaco_cursorMove", { to = "wrappedLineLastNonWhitespaceCharacter" })
-  end, { silent = true })
+  pcall(vim.cmd, "silent! source $HOME/.config/nvim/monaco-neovim-wasm/motion.vim")
 end
 
 if ${scroll} then
-  vim.keymap.set({ "n", "x", "o" }, "zt", function()
-    vim.rpcnotify(chan, "monaco_reveal", { direction = "top", resetCursor = false })
-  end, { silent = true })
-  vim.keymap.set({ "n", "x", "o" }, "zz", function()
-    vim.rpcnotify(chan, "monaco_reveal", { direction = "center", resetCursor = false })
-  end, { silent = true })
-  vim.keymap.set({ "n", "x", "o" }, "zb", function()
-    vim.rpcnotify(chan, "monaco_reveal", { direction = "bottom", resetCursor = false })
-  end, { silent = true })
-  vim.keymap.set({ "n", "x", "o" }, "z<CR>", function()
-    vim.rpcnotify(chan, "monaco_reveal", { direction = "top", resetCursor = true })
-  end, { silent = true })
-  vim.keymap.set({ "n", "x", "o" }, "z.", function()
-    vim.rpcnotify(chan, "monaco_reveal", { direction = "center", resetCursor = true })
-  end, { silent = true })
-  vim.keymap.set({ "n", "x", "o" }, "z-", function()
-    vim.rpcnotify(chan, "monaco_reveal", { direction = "bottom", resetCursor = true })
-  end, { silent = true })
-
-  vim.keymap.set({ "n", "x", "o" }, "H", function()
-    vim.cmd("normal! m'")
-    vim.rpcnotify(chan, "monaco_moveCursor", { to = "top" })
-  end, { silent = true })
-  vim.keymap.set({ "n", "x", "o" }, "M", function()
-    vim.cmd("normal! m'")
-    vim.rpcnotify(chan, "monaco_moveCursor", { to = "middle" })
-  end, { silent = true })
-  vim.keymap.set({ "n", "x", "o" }, "L", function()
-    vim.cmd("normal! m'")
-    vim.rpcnotify(chan, "monaco_moveCursor", { to = "bottom" })
-  end, { silent = true })
+  pcall(vim.cmd, "silent! source $HOME/.config/nvim/monaco-neovim-wasm/scrolling.vim")
 end
 
 local group = api.nvim_create_augroup("MonacoNeovimWasm", { clear = true })
@@ -2317,6 +2277,16 @@ function normalizeSessionFiles(files?: Array<{ path: string; data: Uint8Array | 
     else out.push({ path, data: enc.encode(String(data ?? "")) });
   }
   return out.length ? out : undefined;
+}
+
+function mergeSessionFiles(
+  user?: Array<{ path: string; data: Uint8Array | string }> | null,
+  internal?: Array<{ path: string; data: Uint8Array | string }> | null,
+): Array<{ path: string; data: Uint8Array | string }> | undefined {
+  const a = Array.isArray(internal) ? internal.filter(Boolean) : [];
+  const b = Array.isArray(user) ? user.filter(Boolean) : [];
+  const all = [...a, ...b];
+  return all.length ? all : undefined;
 }
 
 function withAlpha(hex: string, alpha: number): string {

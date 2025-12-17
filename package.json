@@ -1,6 +1,6 @@
 {
   "name": "monaco-neovim-wasm",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "private": false,
   "type": "module",
   "description": "Run real Neovim (WASM) inside Monaco Editor, inspired by monaco-vim but backed by native Neovim RPC.",
