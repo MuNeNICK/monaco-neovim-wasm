@@ -198,7 +198,7 @@ export class MonacoNeovimClient {
     this.editor = editor;
     this.opts = {
       worker: options.worker ?? null,
-      workerUrl: options.workerUrl ?? new URL("./nvimWorker.ts", import.meta.url),
+      workerUrl: options.workerUrl ?? new URL("./nvimWorker.js", import.meta.url),
       sharedInputBytes: options.sharedInputBytes ?? DEFAULT_SHARED_INPUT_BYTES,
       cols: options.cols ?? 120,
       rows: options.rows ?? 40,
@@ -219,39 +219,46 @@ export class MonacoNeovimClient {
       throw new Error(msg);
     }
 
-    this.sharedInput = createSharedInputRing(this.opts.sharedInputBytes);
-    this.attachEditorListeners();
-    this.workerExited = false;
-    this.workerExitCode = null;
-
-    this.worker = this.opts.worker ?? new Worker(this.opts.workerUrl, { type: "module" });
-    this.worker.onmessage = (event: MessageEvent<WorkerMessages>) => this.handleWorkerMessage(event.data);
-    const startMsg: Record<string, unknown> = {
-      type: "start",
-      cols: this.opts.cols,
-      rows: this.opts.rows,
-      wasmPath: this.wasmPath,
-      runtimePath: this.runtimePath,
-      inputBuffer: this.sharedInput?.buffer,
-    };
-    const transfers: Transferable[] = [];
     try {
-      this.worker.postMessage(startMsg, transfers);
-    } catch (_) {
-      this.worker.postMessage({
+      this.sharedInput = createSharedInputRing(this.opts.sharedInputBytes);
+      this.attachEditorListeners();
+      this.workerExited = false;
+      this.workerExitCode = null;
+
+      this.worker = this.opts.worker ?? new Worker(this.opts.workerUrl, { type: "module" });
+      this.worker.onmessage = (event: MessageEvent<WorkerMessages>) => this.handleWorkerMessage(event.data);
+      const startMsg: Record<string, unknown> = {
         type: "start",
         cols: this.opts.cols,
         rows: this.opts.rows,
         wasmPath: this.wasmPath,
         runtimePath: this.runtimePath,
         inputBuffer: this.sharedInput?.buffer,
-      });
+      };
+      const transfers: Transferable[] = [];
+      try {
+        this.worker.postMessage(startMsg, transfers);
+      } catch (_) {
+        this.worker.postMessage({
+          type: "start",
+          cols: this.opts.cols,
+          rows: this.opts.rows,
+          wasmPath: this.wasmPath,
+          runtimePath: this.runtimePath,
+          inputBuffer: this.sharedInput?.buffer,
+        });
+      }
+      this.opts.status("starting...");
+      this.primeSent = false;
+      setTimeout(() => { if (!this.primeSent) void this.primeSession(); }, 300);
+      await this.waitForApi();
+      await this.primeSession();
+    } catch (err) {
+      const msg = (err as { message?: string })?.message || String(err);
+      this.opts.status(`start failed: ${msg}`, true);
+      this.stop(true);
+      throw err;
     }
-    this.opts.status("starting...");
-    this.primeSent = false;
-    setTimeout(() => { if (!this.primeSent) void this.primeSession(); }, 300);
-    await this.waitForApi();
-    await this.primeSession();
   }
 
   stop(silent = false): void {
