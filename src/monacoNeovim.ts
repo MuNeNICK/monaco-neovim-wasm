@@ -1,29 +1,57 @@
 import * as monaco from "monaco-editor";
 import type { editor as MonacoEditor } from "monaco-editor";
-import { encode } from "./msgpack";
-import { createSharedInputRing, DEFAULT_SHARED_INPUT_BYTES, SharedInputRing } from "./sharedInput";
+import { DEFAULT_SHARED_INPUT_BYTES } from "./sharedInput";
 import { defaultRuntimePath, defaultWasmPath } from "./paths";
+import { NeovimWasmSession } from "./neovimWasmSession";
 
 export type StatusEmitter = (text: string, warn?: boolean) => void;
+export type ClipboardAdapter = {
+  readText?: () => Promise<string>;
+  writeText?: (text: string) => Promise<void>;
+};
 
 export type MonacoNeovimOptions = {
   worker?: Worker | null;
   workerUrl?: URL;
+  reuseWorker?: boolean;
   wasmPath?: string;
   runtimePath?: string;
+  env?: Record<string, string>;
+  files?: Array<{ path: string; data: Uint8Array | string }>;
   sharedInputBytes?: number;
   cols?: number;
   rows?: number;
+  minCols?: number;
+  minRows?: number;
+  autoResize?: boolean;
+  resizeDebounceMs?: number;
   status?: StatusEmitter;
   seedLines?: string[];
+  seedName?: string;
+  seedFiletype?: string;
+  uiAttach?: boolean;
+  uiAttachOptions?: {
+    ext_cmdline?: boolean;
+    ext_messages?: boolean;
+    ext_popupmenu?: boolean;
+    rgb?: boolean;
+  };
+  startupCommands?: string[];
+  startupLua?: string;
   visualThemeName?: string;
   rpcTimeoutMs?: number;
+  clipboard?: ClipboardAdapter | null;
+  onStderr?: (text: string) => void;
+  onStartError?: (message?: string) => void;
+  onExit?: (code: number, lastStderr?: string) => void;
+  onWarning?: (message: string) => void;
   onModeChange?: (mode: string) => void;
   onCmdline?: (text: string | null) => void;
   onMessage?: (text: string | null) => void;
   onPopupmenu?: (items: PopupMenuItem[] | null, selected: number) => void;
   cmdlineContainer?: HTMLElement | null;
   shouldHandleKey?: (ev: KeyboardEvent) => boolean;
+  translateKey?: (ev: KeyboardEvent) => string | null;
 };
 
 export type PopupMenuItem = { word: string; kind?: string; menu?: string; info?: string };
@@ -31,47 +59,45 @@ export type PopupMenuItem = { word: string; kind?: string; menu?: string; info?:
 type MonacoNeovimResolvedOptions = {
   worker: Worker | null;
   workerUrl: URL;
+  reuseWorker: boolean;
   wasmPath: string;
   runtimePath: string;
+  env?: Record<string, string>;
+  files?: Array<{ path: string; data: Uint8Array | string }>;
   sharedInputBytes: number;
   cols: number;
   rows: number;
+  minCols: number;
+  minRows: number;
+  autoResize: boolean;
+  resizeDebounceMs: number;
   status: StatusEmitter;
   seedLines: string[];
+  seedName: string;
+  seedFiletype: string;
+  uiAttach: boolean;
+  uiAttachOptions: {
+    ext_cmdline: boolean;
+    ext_messages: boolean;
+    ext_popupmenu: boolean;
+    rgb: boolean;
+  };
+  startupCommands: string[];
+  startupLua: string;
   visualThemeName: string;
   rpcTimeoutMs: number;
+  clipboard?: ClipboardAdapter | null;
+  onStderr?: (text: string) => void;
+  onStartError?: (message?: string) => void;
+  onExit?: (code: number, lastStderr?: string) => void;
+  onWarning?: (message: string) => void;
   onModeChange?: (mode: string) => void;
   onCmdline?: (text: string | null) => void;
   onMessage?: (text: string | null) => void;
   onPopupmenu?: (items: PopupMenuItem[] | null, selected: number) => void;
   cmdlineContainer?: HTMLElement | null;
   shouldHandleKey: (ev: KeyboardEvent) => boolean;
-};
-
-type PendingEntry = {
-  resolve: (value: unknown) => void;
-  reject: (reason?: unknown) => void;
-  ts: number;
-};
-
-type RpcNotify = {
-  type: "rpc-notify";
-  method: string;
-  params?: unknown[];
-};
-
-type RpcResponse = {
-  type: "rpc-response";
-  msgid: number;
-  error: unknown;
-  result: unknown;
-};
-
-type RpcRequest = {
-  type: "rpc-request";
-  msgid: number;
-  method: string;
-  params?: unknown[];
+  translateKey: (ev: KeyboardEvent) => string | null;
 };
 
 type PendingBufSetText = {
@@ -81,16 +107,6 @@ type PendingBufSetText = {
   endColByte: number;
   lines: string[];
 };
-
-type WorkerMessages =
-  | RpcNotify
-  | RpcResponse
-  | RpcRequest
-  | { type: "clipboard-copy"; lines: string[]; regtype: string }
-  | { type: "clipboard-paste"; msgid: number }
-  | { type: "start-error"; message?: string }
-  | { type: "stderr"; message?: string }
-  | { type: "exit"; code: number; lastStderr?: string };
 
 const DEFAULT_SEED = [
   "-- Monaco + Neovim (WASM)",
@@ -192,13 +208,11 @@ return get_selections(...)
 export class MonacoNeovimClient {
   private readonly editor: MonacoEditor.IStandaloneCodeEditor;
   private readonly opts: MonacoNeovimResolvedOptions;
-  private worker: Worker | null = null;
-  private reqId = 1;
-  private workerExited = false;
-  private workerExitCode: number | null = null;
+  private session: NeovimWasmSession | null = null;
   private bufHandle: number | null = null;
-  private sharedInput: SharedInputRing | null = null;
-  private readonly pending = new Map<number, PendingEntry>();
+  private uiCols = 0;
+  private uiRows = 0;
+  private resizeTimer: number | null = null;
   private primeSent = false;
   private lastCursorPos: monaco.Position | null = null;
   private suppressCursorSync = false;
@@ -245,10 +259,6 @@ export class MonacoNeovimClient {
   private pendingCursorSync = false;
   private cursorSyncTimer: number | null = null;
   private originalOptions: Partial<MonacoEditor.IStandaloneEditorConstructionOptions> | null = null;
-  private inputQueue: Uint8Array[] = [];
-  private inputQueueHead = 0;
-  private inputQueuedBytes = 0;
-  private inputFlushTimer: number | null = null;
   private resyncTimer: number | null = null;
 
   constructor(editor: MonacoEditor.IStandaloneCodeEditor, options: MonacoNeovimOptions = {}) {
@@ -256,66 +266,110 @@ export class MonacoNeovimClient {
     this.opts = {
       worker: options.worker ?? null,
       workerUrl: options.workerUrl ?? new URL("./nvimWorker.js", import.meta.url),
+      reuseWorker: options.reuseWorker ?? false,
       wasmPath: options.wasmPath ?? defaultWasmPath,
       runtimePath: options.runtimePath ?? defaultRuntimePath,
+      env: options.env,
+      files: options.files,
       sharedInputBytes: options.sharedInputBytes ?? DEFAULT_SHARED_INPUT_BYTES,
       cols: options.cols ?? 120,
       rows: options.rows ?? 40,
+      minCols: options.minCols ?? 20,
+      minRows: options.minRows ?? 5,
+      autoResize: options.autoResize ?? true,
+      resizeDebounceMs: options.resizeDebounceMs ?? 50,
       status: options.status ?? (() => {}),
       seedLines: options.seedLines ?? DEFAULT_SEED,
+      seedName: options.seedName ?? "monaco-demo.lua",
+      seedFiletype: options.seedFiletype ?? "lua",
+      uiAttach: options.uiAttach ?? true,
+      uiAttachOptions: {
+        ext_cmdline: options.uiAttachOptions?.ext_cmdline ?? true,
+        ext_messages: options.uiAttachOptions?.ext_messages ?? true,
+        ext_popupmenu: options.uiAttachOptions?.ext_popupmenu ?? true,
+        rgb: options.uiAttachOptions?.rgb ?? true,
+      },
+      startupCommands: options.startupCommands ?? [
+        "set noswapfile signcolumn=no number norelativenumber",
+        "set nowrap laststatus=0 cmdheight=1",
+        "set shortmess+=F",
+        "set clipboard=unnamedplus",
+      ],
+      startupLua: options.startupLua ?? "",
       visualThemeName: options.visualThemeName ?? "nvim-visual",
       rpcTimeoutMs: options.rpcTimeoutMs ?? 8000,
+      clipboard: options.clipboard,
+      onStderr: options.onStderr,
+      onStartError: options.onStartError,
+      onExit: options.onExit,
+      onWarning: options.onWarning,
       onModeChange: options.onModeChange,
       onCmdline: options.onCmdline,
       onMessage: options.onMessage,
       onPopupmenu: options.onPopupmenu,
       cmdlineContainer: options.cmdlineContainer,
       shouldHandleKey: options.shouldHandleKey ?? (() => true),
+      translateKey: options.translateKey ?? translateKey,
     };
   }
 
   async start(seedLines?: string[]): Promise<void> {
     this.stop(true);
     this.nextSeedLines = seedLines ?? null;
-    if (!isSharedArrayBufferAvailable()) {
-      const msg = "SharedArrayBuffer is required; serve with COOP/COEP so crossOriginIsolated is true.";
-      this.opts.status(msg, true);
-      throw new Error(msg);
-    }
 
     try {
-      this.sharedInput = createSharedInputRing(this.opts.sharedInputBytes);
+      const initialSize = this.opts.autoResize ? this.computeGridSize() : { cols: this.opts.cols, rows: this.opts.rows };
+      this.uiCols = initialSize.cols;
+      this.uiRows = initialSize.rows;
       this.attachEditorListeners();
-      this.workerExited = false;
-      this.workerExitCode = null;
+      const handlers = {
+        onNotify: (method: string, params: unknown[]) => { void this.handleNotify(method, params); },
+        onRequest: (msgid: number, method: string, params: unknown[]) => { this.handleRequest(msgid, method, params); },
+        onClipboardCopy: (lines: string[], _regtype: string) => { void this.handleClipboardCopy(lines); },
+        onClipboardPaste: (msgid: number) => { this.doClipboardPaste(msgid); },
+        onStderr: (message?: string) => {
+          const text = message == null ? "" : String(message);
+          try { this.opts.onStderr?.(text); } catch (_) {}
+        },
+        onStartError: (message?: string) => {
+          try { this.opts.onStartError?.(message); } catch (_) {}
+          this.opts.status(`start failed: ${message ?? "unknown"}`, true);
+        },
+        onExit: (code: number, lastStderr?: string) => {
+          const suffix = lastStderr ? `: ${lastStderr.trim()}` : "";
+          this.opts.status(`nvim exited (${code})${suffix}`, code !== 0);
+          try { this.opts.onExit?.(code, lastStderr); } catch (_) {}
+        },
+        onWarning: (message: string) => {
+          try { this.opts.onWarning?.(message); } catch (_) {}
+          this.opts.status(message, true);
+        },
+      };
 
-      this.worker = this.opts.worker ?? new Worker(this.opts.workerUrl, { type: "module" });
-      this.worker.onmessage = (event: MessageEvent<WorkerMessages>) => this.handleWorkerMessage(event.data);
-      const startMsg: Record<string, unknown> = {
-        type: "start",
-        cols: this.opts.cols,
-        rows: this.opts.rows,
+      if (!this.session || !this.opts.reuseWorker) {
+        this.session = new NeovimWasmSession({
+          worker: this.opts.worker,
+          workerUrl: this.opts.workerUrl,
+          sharedInputBytes: this.opts.sharedInputBytes,
+          rpcTimeoutMs: this.opts.rpcTimeoutMs,
+          reuseWorker: this.opts.reuseWorker,
+          handlers,
+        });
+      } else {
+        this.session.setHandlers(handlers);
+      }
+      await this.session.start({
+        cols: this.uiCols,
+        rows: this.uiRows,
         wasmPath: this.opts.wasmPath,
         runtimePath: this.opts.runtimePath,
-        inputBuffer: this.sharedInput?.buffer,
-      };
-      const transfers: Transferable[] = [];
-      try {
-      this.worker.postMessage(startMsg, transfers);
-      } catch (_) {
-        this.worker.postMessage({
-          type: "start",
-          cols: this.opts.cols,
-          rows: this.opts.rows,
-          wasmPath: this.opts.wasmPath,
-          runtimePath: this.opts.runtimePath,
-          inputBuffer: this.sharedInput?.buffer,
-        });
-      }
+        env: this.opts.env,
+        files: normalizeSessionFiles(this.opts.files),
+      });
       this.opts.status("starting...");
       this.primeSent = false;
       setTimeout(() => { if (!this.primeSent) void this.primeSession(); }, 300);
-      await this.waitForApi();
+      await this.session.waitForApi();
       await this.primeSession();
     } catch (err) {
       const msg = (err as { message?: string })?.message || String(err);
@@ -326,21 +380,14 @@ export class MonacoNeovimClient {
   }
 
   stop(silent = false): void {
-    if (this.worker) {
-      this.worker.terminate();
-      this.worker = null;
+    if (this.session) {
+      if (this.opts.reuseWorker) {
+        this.session.stop({ terminate: false, silent: true });
+      } else {
+        this.session.dispose();
+        this.session = null;
+      }
     }
-    this.sharedInput = null;
-    this.inputQueue = [];
-    this.inputQueueHead = 0;
-    this.inputQueuedBytes = 0;
-    if (this.inputFlushTimer) {
-      clearTimeout(this.inputFlushTimer);
-      this.inputFlushTimer = null;
-    }
-    this.workerExited = false;
-    this.workerExitCode = null;
-    this.pending.clear();
     this.bufHandle = null;
     this.primeSent = false;
     this.visualSelectionActive = false;
@@ -372,11 +419,19 @@ export class MonacoNeovimClient {
       clearTimeout(this.resyncTimer);
       this.resyncTimer = null;
     }
+    if (this.resizeTimer) {
+      clearTimeout(this.resizeTimer);
+      this.resizeTimer = null;
+    }
     if (!silent) this.opts.status("stopped", true);
     this.disposeEditorListeners();
   }
 
   dispose(): void {
+    if (this.session) {
+      this.session.dispose();
+      this.session = null;
+    }
     this.stop(true);
   }
 
@@ -392,8 +447,36 @@ export class MonacoNeovimClient {
     this.sendNotify("nvim_command", [String(cmd ?? "")]);
   }
 
+  input(keys: string): void {
+    this.sendNotify("nvim_input", [String(keys ?? "")]);
+  }
+
+  paste(text: string): void {
+    this.pasteText(text);
+  }
+
   execLua<T = unknown>(code: string, args: unknown[] = []): Promise<T> {
     return this.rpcCall("nvim_exec_lua", [String(code ?? ""), Array.isArray(args) ? args : []]) as Promise<T>;
+  }
+
+  getSession(): NeovimWasmSession | null {
+    return this.session;
+  }
+
+  resize(cols: number, rows: number): void {
+    const c = Math.max(this.opts.minCols, Number(cols) || 0);
+    const r = Math.max(this.opts.minRows, Number(rows) || 0);
+    if (!Number.isFinite(c) || !Number.isFinite(r) || c <= 0 || r <= 0) return;
+    this.uiCols = c;
+    this.uiRows = r;
+    if (!this.session || !this.session.isRunning()) return;
+    if (!this.primeSent) return;
+    void this.rpcCall("nvim_ui_try_resize", [c, r]).catch(() => {});
+  }
+
+  resizeToEditor(): void {
+    const { cols, rows } = this.computeGridSize();
+    this.resize(cols, rows);
   }
 
   private attachEditorListeners(): void {
@@ -468,8 +551,51 @@ export class MonacoNeovimClient {
         this.positionPreedit();
       }),
     );
+    if (this.opts.autoResize) {
+      this.disposables.push(
+        this.editor.onDidLayoutChange(() => this.scheduleResizeToEditor()),
+        this.editor.onDidChangeConfiguration((e) => {
+          if (
+            e.hasChanged(EditorOption.fontInfo)
+            || e.hasChanged(EditorOption.lineHeight)
+            || e.hasChanged(EditorOption.fontSize)
+            || e.hasChanged(EditorOption.fontFamily)
+          ) {
+            this.scheduleResizeToEditor();
+          }
+        }),
+      );
+    }
     this.initCmdlineUi();
     this.initTextInputListeners();
+  }
+
+  private computeGridSize(): { cols: number; rows: number } {
+    try {
+      const layout = this.editor.getLayoutInfo() as any;
+      const contentWidth = Math.max(0, Number(layout?.contentWidth ?? layout?.width ?? 0) || 0);
+      const contentHeight = Math.max(0, Number(layout?.contentHeight ?? layout?.height ?? 0) || 0);
+
+      const fontInfo = this.editor.getOption(monaco.editor.EditorOption.fontInfo) as any;
+      const charWidth = Math.max(1, Number(fontInfo?.typicalHalfwidthCharacterWidth ?? fontInfo?.maxDigitWidth ?? 0) || 0);
+      const lineHeight = Math.max(1, Number(fontInfo?.lineHeight ?? 0) || 0);
+
+      const cols = Math.max(this.opts.minCols, Math.floor(contentWidth / charWidth));
+      const rows = Math.max(this.opts.minRows, Math.floor(contentHeight / lineHeight));
+      if (Number.isFinite(cols) && Number.isFinite(rows) && cols > 0 && rows > 0) return { cols, rows };
+    } catch (_) {
+    }
+    return { cols: this.opts.cols, rows: this.opts.rows };
+  }
+
+  private scheduleResizeToEditor(): void {
+    if (!this.opts.autoResize) return;
+    if (this.resizeTimer) return;
+    const delay = Math.max(0, Number(this.opts.resizeDebounceMs) || 0);
+    this.resizeTimer = window.setTimeout(() => {
+      this.resizeTimer = null;
+      this.resizeToEditor();
+    }, delay);
   }
 
   private ensurePreeditUi(): void {
@@ -598,6 +724,10 @@ export class MonacoNeovimClient {
       clearTimeout(this.resyncTimer);
       this.resyncTimer = null;
     }
+    if (this.resizeTimer) {
+      clearTimeout(this.resizeTimer);
+      this.resizeTimer = null;
+    }
     this.compositionActive = false;
     this.pendingResyncAfterComposition = false;
     this.delegateInsertToMonaco = false;
@@ -626,19 +756,19 @@ export class MonacoNeovimClient {
     if (this.bufHandle) return;
     this.primeSent = true;
     try {
-      try {
-        await this.rpcCall("nvim_ui_attach", [this.opts.cols, this.opts.rows, {
-          ext_cmdline: true,
-          ext_messages: true,
-          ext_popupmenu: true,
-          rgb: true,
-        }]);
-      } catch (_) {
+      if (this.opts.uiAttach) {
+        try {
+          await this.rpcCall("nvim_ui_attach", [this.uiCols || this.opts.cols, this.uiRows || this.opts.rows, this.opts.uiAttachOptions]);
+        } catch (_) {
+        }
       }
-      this.sendNotify("nvim_command", ["set noswapfile signcolumn=no number norelativenumber"]);
-      this.sendNotify("nvim_command", ["set nowrap laststatus=0 cmdheight=1"]);
-      this.sendNotify("nvim_command", ["set shortmess+=F"]);
-      this.sendNotify("nvim_command", ["set clipboard=unnamedplus"]);
+      for (const cmd of this.opts.startupCommands) {
+        if (!cmd) continue;
+        this.sendNotify("nvim_command", [cmd]);
+      }
+      if (this.opts.startupLua) {
+        try { await this.rpcCall("nvim_exec_lua", [this.opts.startupLua, []]); } catch (_) {}
+      }
       const buf = await this.rpcCall("nvim_get_current_buf", []);
       const id = extractBufId(buf) ?? 1;
       this.bufHandle = id;
@@ -654,54 +784,22 @@ export class MonacoNeovimClient {
       if (!this.lastMode) this.lastMode = "n";
       this.opts.status("ready");
       this.editor.focus();
+      if (this.opts.autoResize) this.scheduleResizeToEditor();
       if (this.opts.onModeChange) this.opts.onModeChange(this.lastMode);
     } catch (err) {
       this.opts.status(`failed to attach: ${(err as Error)?.message ?? err}`, true);
     }
   }
 
-  private handleWorkerMessage(message: WorkerMessages): void {
-    const type = message?.type;
-    if (type === "rpc-response") {
-      const { msgid, error, result } = message as RpcResponse;
-      const entry = this.pending.get(msgid);
-      if (!entry) return;
-      this.pending.delete(msgid);
-      if (error) entry.reject(new Error(String(error)));
-      else entry.resolve(result);
-    } else if (type === "rpc-notify") {
-      const { method, params } = message as RpcNotify;
-      void this.handleNotify(method, params ?? []);
-    } else if (type === "rpc-request") {
-      const { msgid, method, params } = message as RpcRequest;
-      this.handleRequest(msgid, method, params ?? []);
-    } else if (type === "clipboard-copy") {
-      const { lines = [] } = message as { lines: string[] };
-      const text = lines.join("\n");
-      if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).catch(() => {});
-    } else if (type === "clipboard-paste") {
-      const { msgid } = message as { msgid: number };
-      this.doClipboardPaste(msgid);
-    } else if (type === "stderr") {
-      const payload = message as { message?: string };
-      const text = payload?.message;
-      void text;
-    } else if (type === "start-error") {
-      const payload = message as { message?: string };
-      this.opts.status(`start failed: ${payload?.message ?? "unknown"}`, true);
-    } else if (type === "exit") {
-      const payload = message as { code: number; lastStderr?: string };
-      const code = payload.code;
-      const lastStderr = payload.lastStderr;
-      this.workerExited = true;
-      this.workerExitCode = code;
-      const suffix = lastStderr ? `: ${lastStderr.trim()}` : "";
-      this.opts.status(`nvim exited (${code})${suffix}`, code !== 0);
-      if (code !== 0) {
-        this.pending.forEach((entry) => entry.reject(new Error(`nvim exited (${code})${suffix}`)));
-        this.pending.clear();
-      }
+  private handleClipboardCopy(lines: string[]): void {
+    const text = (lines ?? []).join("\n");
+    const adapter = this.opts.clipboard;
+    if (adapter === null) return;
+    if (adapter?.writeText) {
+      adapter.writeText(text).catch(() => {});
+      return;
     }
+    if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).catch(() => {});
   }
 
   private handleRequest(msgid: number, method: string, params: unknown[]): void {
@@ -1159,7 +1257,7 @@ export class MonacoNeovimClient {
 
   private async resyncBufferFromNvim(): Promise<void> {
     if (this.compositionActive) return;
-    if (!this.worker || this.workerExited) return;
+    if (!this.session || !this.session.isRunning()) return;
     if (!this.bufHandle) return;
     try {
       const lines = await this.rpcCall("nvim_buf_get_lines", [this.bufHandle, 0, -1, false]);
@@ -1310,7 +1408,7 @@ export class MonacoNeovimClient {
       }
       if (!this.opts.shouldHandleKey(browserEvent)) return;
       if (browserEvent.ctrlKey || browserEvent.altKey || browserEvent.metaKey) {
-        const key = translateKey(browserEvent);
+        const key = this.opts.translateKey(browserEvent);
         if (!key) return;
         ev.preventDefault();
         this.flushPendingMonacoSync();
@@ -1336,7 +1434,7 @@ export class MonacoNeovimClient {
     }
     if (this.compositionActive || browserEvent.isComposing) return;
     if (!this.opts.shouldHandleKey(browserEvent)) return;
-    const key = translateKey(browserEvent);
+    const key = this.opts.translateKey(browserEvent);
     if (!key) return;
     // Some browsers still dispatch an `input` event even if we preventDefault on
     // keydown. Ignore the next `input` to avoid double-sending text.
@@ -1370,7 +1468,7 @@ export class MonacoNeovimClient {
   private handleMonacoModelChange(ev: monaco.editor.IModelContentChangedEvent): void {
     if (!this.delegateInsertToMonaco) return;
     if (this.applyingFromNvim) return;
-    if (!this.worker || this.workerExited) return;
+    if (!this.session || !this.session.isRunning()) return;
     if (!this.bufHandle) return;
     const model = this.editor.getModel();
     if (!model) return;
@@ -1436,7 +1534,7 @@ export class MonacoNeovimClient {
   }
 
   private flushPendingMonacoSync(): void {
-    if (!this.worker || this.workerExited) return;
+    if (!this.session || !this.session.isRunning()) return;
     if (!this.bufHandle) return;
     const model = this.editor.getModel();
     if (!model) return;
@@ -1461,7 +1559,7 @@ export class MonacoNeovimClient {
   }
 
   private syncCursorToNvimNow(): void {
-    if (!this.worker || this.workerExited) return;
+    if (!this.session || !this.session.isRunning()) return;
     if (!this.bufHandle) return;
     const model = this.editor.getModel();
     const pos = this.editor.getPosition();
@@ -1525,95 +1623,16 @@ send_cursor()
   }
 
   private sendNotify(method: string, params: unknown[] = []): void {
-    if (!this.worker || this.workerExited) return;
-    const msg = encode([2, method, params] as any);
-    this.postInput(msg);
+    this.session?.notify(method, params);
   }
 
   private sendRpcResponse(msgid: number, error: unknown, result: unknown): void {
-    const msg = encode([1, msgid, error, result] as any);
-    this.postInput(msg);
+    this.session?.respond(msgid, error, result);
   }
 
   private rpcCall(method: string, params: unknown[] = []): Promise<any> {
-    return new Promise((resolve, reject) => {
-      if (!this.worker) { reject(new Error("session not started")); return; }
-      if (this.workerExited) {
-        const code = this.workerExitCode;
-        reject(new Error(code != null ? `nvim exited (${code})` : "nvim exited"));
-        return;
-      }
-      const id = this.reqId++;
-      this.pending.set(id, { resolve, reject, ts: Date.now() });
-      const msg = encode([0, id, method, params] as any);
-      this.postInput(msg);
-      setTimeout(() => {
-        if (this.pending.has(id)) {
-          this.pending.delete(id);
-          reject(new Error(this.workerExited
-            ? (this.workerExitCode != null ? `nvim exited (${this.workerExitCode})` : "nvim exited")
-            : `rpc timeout: ${method}`));
-        }
-      }, this.opts.rpcTimeoutMs);
-    });
-  }
-
-  private postInput(data: Uint8Array): void {
-    if (!data || !data.buffer) return;
-    const payload = normalizeTransfer(data);
-    if (!this.sharedInput) return;
-    if (this.inputQueueHead >= this.inputQueue.length) {
-      const ok = this.sharedInput.push(payload);
-      if (ok) return;
-    }
-    this.enqueueInput(payload);
-  }
-
-  private enqueueInput(payload: Uint8Array): void {
-    if (!this.sharedInput) return;
-    this.inputQueue.push(payload);
-    this.inputQueuedBytes += payload.byteLength;
-    const maxQueued = 4 * 1024 * 1024;
-    if (this.inputQueuedBytes > maxQueued) {
-      this.opts.status("input queue overflow (ring buffer too small); dropping queued input", true);
-      this.inputQueue = [];
-      this.inputQueueHead = 0;
-      this.inputQueuedBytes = 0;
-      return;
-    }
-    this.scheduleFlushInput();
-  }
-
-  private scheduleFlushInput(): void {
-    if (this.inputFlushTimer) return;
-    this.inputFlushTimer = window.setTimeout(() => {
-      this.inputFlushTimer = null;
-      this.flushInputQueue();
-    }, 0);
-  }
-
-  private flushInputQueue(): void {
-    if (!this.sharedInput || this.inputQueueHead >= this.inputQueue.length) return;
-    while (this.inputQueueHead < this.inputQueue.length) {
-      const next = this.inputQueue[this.inputQueueHead];
-      const ok = this.sharedInput.push(next);
-      if (!ok) break;
-      this.inputQueueHead += 1;
-      this.inputQueuedBytes -= next.byteLength;
-    }
-    if (this.inputQueueHead > 64 && this.inputQueueHead > (this.inputQueue.length / 2)) {
-      this.inputQueue = this.inputQueue.slice(this.inputQueueHead);
-      this.inputQueueHead = 0;
-    }
-    if (this.inputQueueHead < this.inputQueue.length) {
-      this.inputFlushTimer = window.setTimeout(() => {
-        this.inputFlushTimer = null;
-        this.flushInputQueue();
-      }, 2);
-    } else {
-      this.inputQueue = [];
-      this.inputQueueHead = 0;
-    }
+    if (!this.session) return Promise.reject(new Error("session not started"));
+    return this.session.call(method, params);
   }
 
   private doClipboardPaste(msgid: number): void {
@@ -1621,6 +1640,20 @@ send_cursor()
       const lines = (text || "").split(/\r?\n/);
       this.sendRpcResponse(msgid, null, [lines, "v"]);
     };
+    const adapter = this.opts.clipboard;
+    if (adapter === null) {
+      fallback("");
+      return;
+    }
+    if (adapter?.readText) {
+      adapter.readText()
+        .then((text) => fallback(text || ""))
+        .catch(() => {
+          const manual = window.prompt("Paste text");
+          fallback(manual || "");
+        });
+      return;
+    }
     if (!navigator.clipboard?.readText) {
       const manual = window.prompt("Paste text");
       fallback(manual || "");
@@ -1814,28 +1847,14 @@ send_cursor()
       await this.rpcCall("nvim_buf_set_option", [buf, "modifiable", true]);
       await this.rpcCall("nvim_buf_set_option", [buf, "modified", true]);
       await this.rpcCall("nvim_buf_set_option", [buf, "buftype", ""]);
-      await this.rpcCall("nvim_buf_set_option", [buf, "filetype", "lua"]);
-      await this.rpcCall("nvim_buf_set_name", [buf, "monaco-demo.lua"]);
+      await this.rpcCall("nvim_buf_set_option", [buf, "filetype", this.opts.seedFiletype]);
+      await this.rpcCall("nvim_buf_set_name", [buf, this.opts.seedName]);
       return seed;
     } catch (_) {
       return null;
     }
   }
 
-  private async waitForApi(): Promise<void> {
-    const delay = 300;
-    const maxMs = Math.min(Math.max(this.opts.rpcTimeoutMs * 2, 10_000), 15_000);
-    const retries = Math.ceil(maxMs / delay);
-    for (let i = 0; i < retries; i += 1) {
-      try {
-        await this.rpcCall("nvim_get_api_info", []);
-        return;
-      } catch (_) {
-        await new Promise((r) => setTimeout(r, delay));
-      }
-    }
-    throw new Error("nvim_get_api_info timed out");
-  }
 }
 
 export function createMonacoNeovim(
@@ -2037,6 +2056,21 @@ function isVisualMode(mode: string): boolean {
   return m.includes("v") || m.includes("V") || m.includes("\u0016") || m.includes("s") || m.includes("S") || m.includes("\u0013");
 }
 
+function normalizeSessionFiles(files?: Array<{ path: string; data: Uint8Array | string }> | null) {
+  if (!files || !Array.isArray(files) || files.length === 0) return undefined;
+  const enc = new TextEncoder();
+  const out: Array<{ path: string; data: Uint8Array }> = [];
+  for (const f of files) {
+    if (!f) continue;
+    const path = String((f as any).path ?? "");
+    if (!path) continue;
+    const data = (f as any).data;
+    if (data instanceof Uint8Array) out.push({ path, data });
+    else out.push({ path, data: enc.encode(String(data ?? "")) });
+  }
+  return out.length ? out : undefined;
+}
+
 function withAlpha(hex: string, alpha: number): string {
   const clean = (hex || "").replace("#", "");
   if (clean.length !== 6) return hex;
@@ -2163,13 +2197,4 @@ function parsePopupmenuItems(items: unknown): PopupMenuItem[] {
     }
   }
   return out.filter((x) => x.word.length > 0);
-}
-
-function normalizeTransfer(data: Uint8Array): Uint8Array {
-  if (data.byteOffset === 0 && data.byteLength === data.buffer.byteLength) return data;
-  return data.slice();
-}
-
-function isSharedArrayBufferAvailable(): boolean {
-  return typeof SharedArrayBuffer !== "undefined" && typeof crossOriginIsolated !== "undefined" && crossOriginIsolated;
 }

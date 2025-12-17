@@ -16,6 +16,8 @@ type StartMessage = {
   wasmPath: string;
   runtimePath: string;
   inputBuffer?: SharedArrayBuffer | null;
+  env?: Record<string, string> | null;
+  files?: Array<{ path: string; data: Uint8Array | ArrayBuffer | ArrayLike<number> | { type: "Buffer"; data: number[] } }> | null;
 };
 
 type StopMessage = { type: "stop" };
@@ -30,6 +32,8 @@ let inputFd: RingFd | null = null;
 const stderrDecoder = new TextDecoder();
 let lastStderr = "";
 let fatalSent = false;
+let cachedWasm: { url: string; bytes: Uint8Array } | null = null;
+let cachedRuntime: { url: string; entries: TarEntry[] } | null = null;
 
 self.addEventListener("error", (ev) => {
   if (fatalSent) return;
@@ -137,7 +141,7 @@ class SinkFd extends Fd {
   fd_close() { return wasi.ERRNO_SUCCESS; }
 }
 
-async function startNvim({ cols, rows, wasmPath, runtimePath, inputBuffer }: StartMessage) {
+async function startNvim({ cols, rows, wasmPath, runtimePath, inputBuffer, env: extraEnv, files }: StartMessage) {
   let exitCode = 1;
   try {
     if (!inputBuffer) {
@@ -149,34 +153,18 @@ async function startNvim({ cols, rows, wasmPath, runtimePath, inputBuffer }: Sta
     rpcDecoder = null;
     inputFd = new RingFd(inputBuffer);
 
-    const [wasmBytes, runtimeArchive] = await Promise.all([
-      fetchBytes(wasmPath),
-      fetchBytes(runtimePath),
-    ]);
-
-    let runtimeBytes: Uint8Array;
-    if (looksLikeGzip(runtimeArchive)) {
-      try {
-        runtimeBytes = gunzipSync(runtimeArchive);
-      } catch (e) {
-        throw new Error(`gunzip runtime failed: ${(e as Error)?.message ?? e}`);
-      }
-    } else {
-      runtimeBytes = runtimeArchive;
-    }
-    let untarred: TarEntry[];
-    try {
-      untarred = untar(runtimeBytes);
-    } catch (e) {
-      throw new Error(`untar runtime failed: ${(e as Error)?.message ?? e}`);
-    }
+    const wasmBytes = await getCachedWasmBytes(wasmPath);
+    const untarred = await getCachedRuntimeEntries(runtimePath);
     const fsRoot = buildFs(untarred, () => {});
+    if (files && Array.isArray(files) && files.length) applyExtraFiles(fsRoot, files);
 
     const stdinFd = inputFd!;
     const stdoutFd = new SinkFd(handleStdout);
     const stderrFd = new SinkFd((data) => {
       const msg = stderrDecoder.decode(data);
-      lastStderr = msg || lastStderr;
+      if (msg) {
+        lastStderr = (lastStderr + msg).slice(-8192);
+      }
       postMessage({ type: "stderr", message: msg });
     });
 
@@ -198,6 +186,12 @@ async function startNvim({ cols, rows, wasmPath, runtimePath, inputBuffer }: Sta
       `COLUMNS=${cols || 120}`,
       `LINES=${rows || 40}`,
     ];
+    if (extraEnv && typeof extraEnv === "object") {
+      for (const [k, v] of Object.entries(extraEnv)) {
+        if (!k) continue;
+        env.push(`${k}=${String(v ?? "")}`);
+      }
+    }
     activeWasi = new WASI(args, env, [stdinFd, stdoutFd, stderrFd, preopen, preopenTmp], { debug: false });
     activeWasi.fds[0] = stdinFd;
     activeWasi.fds[1] = stdoutFd;
@@ -222,6 +216,70 @@ async function startNvim({ cols, rows, wasmPath, runtimePath, inputBuffer }: Sta
   }
 
   postMessage({ type: "exit", code: exitCode, lastStderr });
+}
+
+async function getCachedWasmBytes(url: string): Promise<Uint8Array> {
+  if (cachedWasm && cachedWasm.url === url && cachedWasm.bytes?.byteLength) return cachedWasm.bytes;
+  const bytes = await fetchBytes(url);
+  cachedWasm = { url, bytes };
+  return bytes;
+}
+
+async function getCachedRuntimeEntries(url: string): Promise<TarEntry[]> {
+  if (cachedRuntime && cachedRuntime.url === url && cachedRuntime.entries?.length) return cachedRuntime.entries;
+  const archive = await fetchBytes(url);
+  let runtimeBytes: Uint8Array;
+  if (looksLikeGzip(archive)) {
+    try {
+      runtimeBytes = gunzipSync(archive);
+    } catch (e) {
+      throw new Error(`gunzip runtime failed: ${(e as Error)?.message ?? e}`);
+    }
+  } else {
+    runtimeBytes = archive;
+  }
+  let entries: TarEntry[];
+  try {
+    entries = untar(runtimeBytes);
+  } catch (e) {
+    throw new Error(`untar runtime failed: ${(e as Error)?.message ?? e}`);
+  }
+  cachedRuntime = { url, entries };
+  return entries;
+}
+
+function applyExtraFiles(fsRoot: DirNode, files: Array<{ path: string; data: any }>) {
+  for (const file of files) {
+    const rawPath = String(file?.path ?? "");
+    const clean = rawPath.replace(/^\/+/, "").replace(/^\.\/+/, "");
+    if (!clean || clean.endsWith("/")) continue;
+    const data = toU8(file?.data);
+    if (!data) continue;
+    const parts = clean.split("/").filter(Boolean);
+    if (!parts.length) continue;
+    let dir: DirNode = fsRoot;
+    for (let i = 0; i < parts.length - 1; i += 1) {
+      const part = parts[i];
+      if (!dir.contents.has(part)) dir.contents.set(part, new Directory(new Map()));
+      dir = dir.contents.get(part) as DirNode;
+    }
+    const leaf = parts[parts.length - 1];
+    dir.contents.set(leaf, new File(data, { readonly: false }));
+  }
+}
+
+function toU8(data: any): Uint8Array | null {
+  if (!data) return new Uint8Array();
+  if (data instanceof Uint8Array) return data;
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  if (data instanceof SharedArrayBuffer) return new Uint8Array(data);
+  if (Array.isArray(data)) return new Uint8Array(data);
+  if (data && data.type === "Buffer" && Array.isArray(data.data)) return new Uint8Array(data.data);
+  try {
+    return new TextEncoder().encode(String(data));
+  } catch (_) {
+    return null;
+  }
 }
 
 function handleStdout(chunk: Uint8Array) {
