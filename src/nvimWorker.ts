@@ -31,7 +31,6 @@ const stderrDecoder = new TextDecoder();
 let lastStderr = "";
 let fatalSent = false;
 
-// Surface any uncaught errors from the worker itself.
 self.addEventListener("error", (ev) => {
   if (fatalSent) return;
   fatalSent = true;
@@ -41,7 +40,6 @@ self.addEventListener("error", (ev) => {
     postMessage({ type: "start-error", message: stack ? `${msg}\n${stack}` : msg });
     postMessage({ type: "exit", code: 1, lastStderr });
   } catch (_) {
-    // ignore
   }
 });
 
@@ -55,7 +53,6 @@ self.addEventListener("unhandledrejection", (ev) => {
     postMessage({ type: "start-error", message: stack ? `${msg}\n${stack}` : msg });
     postMessage({ type: "exit", code: 1, lastStderr });
   } catch (_) {
-    // ignore
   }
 });
 
@@ -70,7 +67,6 @@ self.onmessage = (event: MessageEvent<InboundMessage>) => {
     try {
       activeWasi?.wasiImport?.proc_exit?.(0);
     } catch (_) {
-      // ignore
     }
     inputFd = null;
   }
@@ -99,22 +95,16 @@ class RingFd extends Fd {
   fd_read(size: number) {
     const max = Math.min(Math.max(0, Number(size) || 0), this.capacity);
     if (max === 0) return { ret: wasi.ERRNO_AGAIN, data: new Uint8Array() };
+    let head = Atomics.load(this.ctrl, 0);
+    const tail = Atomics.load(this.ctrl, 1);
+    if (head === tail) return { ret: wasi.ERRNO_AGAIN, data: new Uint8Array() };
     const out = new Uint8Array(max);
     let written = 0;
-    while (written === 0) {
-      let head = Atomics.load(this.ctrl, 0);
-      const tail = Atomics.load(this.ctrl, 1);
-      if (head === tail) {
-        if (typeof Atomics.wait !== "function") return { ret: wasi.ERRNO_AGAIN, data: new Uint8Array() };
-        Atomics.wait(this.ctrl, 1, tail, 1000);
-        continue;
-      }
-      while (head !== tail && written < max) {
-        out[written++] = this.data[head];
-        head = (head + 1) % this.capacity;
-      }
-      Atomics.store(this.ctrl, 0, head);
+    while (head !== tail && written < max) {
+      out[written++] = this.data[head];
+      head = (head + 1) % this.capacity;
     }
+    Atomics.store(this.ctrl, 0, head);
     return { ret: wasi.ERRNO_SUCCESS, data: out.slice(0, written) };
   }
 
@@ -241,24 +231,9 @@ function handleStdout(chunk: Uint8Array) {
   try {
     rpcDecoder.push(chunk);
   } catch (err) {
-    try {
-      // Help diagnose malformed stdout that breaks the RPC stream.
-      console.error("[nvim rpc] decoder error", err);
-      console.error("[nvim rpc] chunk (hex)", toHex(chunk));
-    } catch (_) {
-      // ignore
-    }
+    void err;
     rpcDecoder = new Decoder(handleMessage);
   }
-}
-
-function toHex(data: Uint8Array): string {
-  const max = 128; // limit log size
-  let out = "";
-  for (let i = 0; i < data.length && i < max; i += 1) {
-    out += data[i].toString(16).padStart(2, "0");
-  }
-  return out;
 }
 
 function handleMessage(msg: unknown) {
@@ -384,10 +359,8 @@ function ensureDir(root: DirNode, path: string) {
 }
 
 function makeEnv(procExit?: (code: number) => void) {
-  // `Tag`/`Exception` are part of the wasm exceptions proposal and are not in the TS lib yet.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const wasmAny = WebAssembly as any;
-  const cLongjmp = new wasmAny.Tag({ parameters: ["i32"], results: [] });
+  const cLongjmp = new wasmAny.Tag({ parameters: ["i32"], results: [] }) as any;
   return {
     flock: () => 0,
     getpid: () => 1,
@@ -407,7 +380,7 @@ function makeEnv(procExit?: (code: number) => void) {
     system: () => -1,
     tmpnam: () => 0,
     __c_longjmp: cLongjmp,
-  };
+  } as WebAssembly.ModuleImports;
 }
 
 class RootedPreopenDirectory extends PreopenDirectory {
@@ -428,8 +401,6 @@ class RootedPreopenDirectory extends PreopenDirectory {
   path_remove_directory(path_str: string) { return super.path_remove_directory(this.#strip(path_str)); }
   path_link(path_str: string, inode: Inode, allow_dir: boolean) { return super.path_link(this.#strip(path_str), inode, allow_dir); }
   path_readlink(path_str: string) { return super.path_readlink(this.#strip(path_str)); }
-  // `path_symlink` exists at runtime but is missing from the shim typings.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   path_symlink(old_path: string, new_path: string) {
     const target = (PreopenDirectory.prototype as unknown as { path_symlink?: (oldPath: string, newPath: string) => number }).path_symlink;
     if (!target) return wasi.ERRNO_NOTSUP;

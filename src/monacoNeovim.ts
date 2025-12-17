@@ -350,7 +350,6 @@ export class MonacoNeovimClient {
       await this.syncVisualSelectionColor();
       if (!this.lastMode) this.lastMode = "n";
       this.opts.status("ready");
-      // Ensure the editor is focused and mode indicator is populated immediately after startup.
       this.editor.focus();
       if (this.opts.onModeChange) this.opts.onModeChange(this.lastMode);
     } catch (err) {
@@ -383,9 +382,7 @@ export class MonacoNeovimClient {
     } else if (type === "stderr") {
       const payload = message as { message?: string };
       const text = payload?.message;
-      if (text) {
-        console.error("[nvim stderr]", text);
-      }
+      void text;
     } else if (type === "start-error") {
       const payload = message as { message?: string };
       this.opts.status(`start failed: ${payload?.message ?? "unknown"}`, true);
@@ -393,7 +390,6 @@ export class MonacoNeovimClient {
       const payload = message as { code: number; lastStderr?: string };
       const code = payload.code;
       const lastStderr = payload.lastStderr;
-      // If Neovim exited before we attached, avoid cascading RPC timeouts and surface the exit code.
       this.workerExited = true;
       this.workerExitCode = code;
       const suffix = lastStderr ? `: ${lastStderr.trim()}` : "";
@@ -422,7 +418,6 @@ export class MonacoNeovimClient {
           const allLines = await this.rpcCall("nvim_buf_get_lines", [id, 0, -1, false]);
           this.applyBuffer(Array.isArray(allLines) ? (allLines as string[]) : [""]);
         } catch (_) {
-          // ignore
         }
         await this.refreshCursorMode();
       }
@@ -565,9 +560,7 @@ export class MonacoNeovimClient {
       }
       await this.updateVisualSelection(this.lastMode);
     } catch (err) {
-      // Surface once for debugging input freeze issues.
-      // eslint-disable-next-line no-console
-      console.error("[nvim rpc] refreshCursorMode failed", err);
+      void err;
     } finally {
       this.cursorRefreshInFlight = false;
       if (this.cursorRefreshPending) {
@@ -609,7 +602,6 @@ export class MonacoNeovimClient {
       else this.editor.setSelections(selections);
       this.visualSelectionActive = true;
     } catch (_) {
-      // ignore selection fetch failures
     }
   }
 
@@ -639,7 +631,6 @@ export class MonacoNeovimClient {
       });
       this.editor.updateOptions({ theme: this.opts.visualThemeName });
     } catch (_) {
-      // ignore theme sync errors
     }
   }
 
@@ -649,14 +640,12 @@ export class MonacoNeovimClient {
       const bg = normalizeHlBg(hl);
       if (bg) return bg;
     } catch (_) {
-      // ignore
     }
     try {
       const hl = await this.rpcCall("nvim_get_hl_by_name", ["Visual", true]);
       const bg = normalizeHlBg(hl);
       if (bg) return bg;
     } catch (_) {
-      // ignore
     }
     return null;
   }
@@ -680,7 +669,6 @@ export class MonacoNeovimClient {
   }
 
   private async waitForApi(): Promise<void> {
-    // Allow more startup time on slower machines; base it on rpc timeout and cap at ~15s.
     const delay = 300;
     const maxMs = Math.min(Math.max(this.opts.rpcTimeoutMs * 2, 10_000), 15_000);
     const retries = Math.ceil(maxMs / delay);

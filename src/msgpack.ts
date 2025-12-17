@@ -1,6 +1,3 @@
-// Minimal MessagePack encoder/decoder for the subset used by Neovim RPC.
-// Supports: nil, booleans, fixint/int8/16/32/64, strings, binary, arrays, maps, and ext objects.
-
 export type MsgpackExt = { type: number; data: Uint8Array };
 
 type MsgpackPrimitive = null | boolean | number | bigint | string | Uint8Array | MsgpackExt;
