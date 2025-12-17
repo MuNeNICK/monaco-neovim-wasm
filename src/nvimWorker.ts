@@ -320,8 +320,13 @@ function handleMessage(msg: unknown) {
       || method === "monaco_cursor"
       || method === "monaco_mode"
       || method === "monaco_cursorMove"
+      || method === "monaco_scroll"
       || method === "monaco_reveal"
       || method === "monaco_moveCursor"
+      || method === "monaco_scrolloff"
+      || method === "monaco_host_command"
+      || method === "monaco_buf_enter"
+      || method === "monaco_buf_delete"
     ) {
       postMessage({ type: "rpc-notify", method, params });
     }

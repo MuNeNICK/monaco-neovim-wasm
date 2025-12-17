@@ -1,6 +1,6 @@
 # monaco-neovim-wasm
 
-Run the actual Neovim core (WASM, headless) behind Monaco. This is inspired by `monaco-vim`, but uses Neovim's native msgpack-RPC instead of a keybinding shim.
+Run the actual Neovim core (WASM, headless) behind Monaco, using Neovim's native msgpack-RPC instead of a keybinding shim.
 
 ## Usage in code
 ```ts
@@ -23,11 +23,22 @@ await client.start();
 - If you host assets separately, set `wasmPath`/`runtimePath`.
 - To customize startup, use `startupCommands` / `startupLua`, and seed via `seedLines` / `seedFiletype` / `seedName`.
 - Clipboard can be customized or disabled with `clipboard` (or set `clipboard: null`).
-- For accurate wrapped-motion like `gj`/`gk`/`g0`/`g$`, enable Neovim `set wrap` and set `syncWrap: true` + `wrappedLineMotions: true` (uses Monaco wrapped-line movement as a workaround, similar to vscode-neovim).
-- For scroll/reveal motions like `zt`/`zz`/`zb` (and cursor-to-screen-line `H`/`M`/`L`), set `scrollMotions: true` (delegates viewport positioning to Monaco and optionally moves cursor for `z<CR>`/`z.`/`z-`).
+- For accurate wrapped-motion like `gj`/`gk`/`g0`/`g$`, enable Neovim `set wrap` and set `syncWrap: true` + `wrappedLineMotions: true` (uses Monaco wrapped-line movement as a workaround).
+- For scroll/reveal motions like `zt`/`zz`/`zb` (and cursor-to-screen-line `H`/`M`/`L`), set `scrollMotions: true` (delegates viewport positioning to Monaco and optionally moves cursor for `z<CR>`/`z.`/`z-`). It also provides delegated scroll keys `<C-e>/<C-y>/<C-d>/<C-u>/<C-f>/<C-b>` for wrap-friendly scrolling.
+- `scrolloff`: when set, enforces a Vim-like scroll margin on the Monaco viewport (in screen lines).
+- `syncScrolloff`: when `true`, mirrors Neovim’s `:set scrolloff?` into Monaco (defaults to `true` when `scrollMotions: true`).
+- Reserved Monaco shortcuts: the library captures `Ctrl+F/B/D/U/E/Y` in the capture phase (when not delegating insert-mode to Monaco) so Vim scrolling works even if Monaco has default bindings.
+- `ctrlKeysForNormalMode` / `ctrlKeysForInsertMode`: optional allowlists for `Ctrl+key`. When set, only listed `Ctrl` combinations are forwarded to Neovim; others are left for Monaco/browser. (Browser-reserved shortcuts like `Ctrl+W` may still win.)
+- `altKeysForNormalMode` / `altKeysForInsertMode`: optional allowlists for `Alt+key` (same behavior as the Ctrl allowlists).
+- `metaKeysForNormalMode` / `metaKeysForInsertMode`: optional allowlists for `Meta(Command)+key` (same behavior as the Ctrl allowlists).
+- `searchHighlights`: when `true`, renders Neovim search highlights as Monaco decorations in the visible viewport (persistent highlights follow `:set hlsearch`, and incremental highlights appear while typing `/` or `?`).
+- `hostCommands`: when `true`, sources `$HOME/.config/nvim/monaco-neovim-wasm/host-commands.vim` and enables `:e/:w/:q`-style delegation to the host.
+- `fileSystem`: optional adapter used by the built-in host-command handler to implement `:e` and `:w` without wiring `onHostCommand`.
+- `onHostCommand`: optional callback that receives host commands like `{ action: "edit", path }` / `{ action: "write", path }`.
+- Multiple buffers: when Neovim switches buffers (e.g. `:bnext`, `:bprev`, `:buffer`), the client swaps the Monaco model accordingly.
 
-## Loading Vimscript overrides (vscode-neovim style)
-This package keeps the host-aware mappings as Vimscript (like `vscode-motion.vim` / `vscode-scrolling.vim`), but still ships as a single JS dependency by embedding those `.vim` files into Neovim’s in-memory filesystem and sourcing them when needed.
+## Loading Vimscript overrides
+This package keeps host-aware mappings as Vimscript, but still ships as a single JS dependency by embedding those `.vim` files into Neovim’s in-memory filesystem and sourcing them when needed.
 
 Built-in overrides are mounted at `$HOME/.config/nvim/monaco-neovim-wasm/motion.vim` and `$HOME/.config/nvim/monaco-neovim-wasm/scrolling.vim`.
 
@@ -89,3 +100,7 @@ npm run build
 - Serve with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` (and ensure subresources are CORP/CORS compatible). The demo's Vite dev/preview servers send these headers.
 - Neovim clipboard calls go through the browser Clipboard API; a prompt is used as a fallback.
 - The demo sets Neovim options for a minimal UI (`noswapfile`, `norelativenumber`, etc.) and seeds a Lua buffer; adjust in `src/monacoNeovim.ts` if needed.
+
+## Acknowledgements
+- https://github.com/brijeshb42/monaco-vim
+- https://github.com/vscode-neovim/vscode-neovim
