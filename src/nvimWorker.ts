@@ -255,7 +255,13 @@ function handleMessage(msg: unknown) {
       const lines = Array.isArray(params?.[0]) ? params[0] : [];
       const regtype = typeof params?.[1] === "string" ? params[1] : "v";
       postMessage({ type: "clipboard-copy", lines, regtype });
-    } else if (method === "nvim_buf_lines_event" || method === "nvim_buf_detach_event") {
+    } else if (
+      method === "nvim_buf_lines_event"
+      || method === "nvim_buf_detach_event"
+      || method === "redraw"
+      || method === "monaco_cursor"
+      || method === "monaco_mode"
+    ) {
       postMessage({ type: "rpc-notify", method, params });
     }
   }

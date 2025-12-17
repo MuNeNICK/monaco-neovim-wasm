@@ -22,19 +22,25 @@ export class SharedInputRing {
     } else {
       src = new Uint8Array(bytes);
     }
-    let head = Atomics.load(this.ctrl, 0);
-    let tail = Atomics.load(this.ctrl, 1);
-    let written = 0;
-    for (let i = 0; i < src.length; i += 1) {
-      const next = (tail + 1) % this.capacity;
-      if (next === head) break; // full
-      this.data[tail] = src[i];
-      tail = next;
-      written += 1;
+    if (!src.byteLength) return true;
+    const head = Atomics.load(this.ctrl, 0);
+    const tail = Atomics.load(this.ctrl, 1);
+
+    const used = tail >= head ? (tail - head) : (this.capacity - (head - tail));
+    const free = (this.capacity - used - 1);
+    if (src.byteLength > free) return false;
+
+    const endSpace = this.capacity - tail;
+    if (src.byteLength <= endSpace) {
+      this.data.set(src, tail);
+      Atomics.store(this.ctrl, 1, (tail + src.byteLength) % this.capacity);
+    } else {
+      this.data.set(src.subarray(0, endSpace), tail);
+      this.data.set(src.subarray(endSpace), 0);
+      Atomics.store(this.ctrl, 1, src.byteLength - endSpace);
     }
-    Atomics.store(this.ctrl, 1, tail);
-    if (written > 0) Atomics.notify(this.ctrl, 1);
-    return written === src.length;
+    Atomics.notify(this.ctrl, 1);
+    return true;
   }
 }
 

@@ -14,6 +14,10 @@ await client.start();
 ```
 - `client.stop()` tears down the worker; `client.dispose()` cleans up listeners.
 - Custom worker URLs are supported via `workerUrl`/`worker` options; `defaultWorkerUrl` is exported.
+- Cmdline display: provide `onCmdline` (or set `cmdlineContainer: null` to disable the built-in overlay).
+- Messages/popupmenu: use `onMessage`/`onPopupmenu` (or rely on the built-in overlays).
+- If you need to reserve specific shortcuts for the host app, use `shouldHandleKey`.
+- If you host assets separately, set `wasmPath`/`runtimePath`.
 
 ## Demo
 The demo is a separate package under `demo/` and is meant to run against the published `monaco-neovim-wasm` package.

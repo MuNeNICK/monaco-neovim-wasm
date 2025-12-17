@@ -9,7 +9,8 @@ export type StatusEmitter = (text: string, warn?: boolean) => void;
 export type MonacoNeovimOptions = {
   worker?: Worker | null;
   workerUrl?: URL;
-  useMessagePort?: boolean;
+  wasmPath?: string;
+  runtimePath?: string;
   sharedInputBytes?: number;
   cols?: number;
   rows?: number;
@@ -18,11 +19,20 @@ export type MonacoNeovimOptions = {
   visualThemeName?: string;
   rpcTimeoutMs?: number;
   onModeChange?: (mode: string) => void;
+  onCmdline?: (text: string | null) => void;
+  onMessage?: (text: string | null) => void;
+  onPopupmenu?: (items: PopupMenuItem[] | null, selected: number) => void;
+  cmdlineContainer?: HTMLElement | null;
+  shouldHandleKey?: (ev: KeyboardEvent) => boolean;
 };
+
+export type PopupMenuItem = { word: string; kind?: string; menu?: string; info?: string };
 
 type MonacoNeovimResolvedOptions = {
   worker: Worker | null;
   workerUrl: URL;
+  wasmPath: string;
+  runtimePath: string;
   sharedInputBytes: number;
   cols: number;
   rows: number;
@@ -31,6 +41,11 @@ type MonacoNeovimResolvedOptions = {
   visualThemeName: string;
   rpcTimeoutMs: number;
   onModeChange?: (mode: string) => void;
+  onCmdline?: (text: string | null) => void;
+  onMessage?: (text: string | null) => void;
+  onPopupmenu?: (items: PopupMenuItem[] | null, selected: number) => void;
+  cmdlineContainer?: HTMLElement | null;
+  shouldHandleKey: (ev: KeyboardEvent) => boolean;
 };
 
 type PendingEntry = {
@@ -57,6 +72,14 @@ type RpcRequest = {
   msgid: number;
   method: string;
   params?: unknown[];
+};
+
+type PendingBufSetText = {
+  startRow: number;
+  startColByte: number;
+  endRow: number;
+  endColByte: number;
+  lines: string[];
 };
 
 type WorkerMessages =
@@ -168,8 +191,6 @@ return get_selections(...)
 export class MonacoNeovimClient {
   private readonly editor: MonacoEditor.IStandaloneCodeEditor;
   private readonly opts: MonacoNeovimResolvedOptions;
-  private readonly wasmPath = defaultWasmPath;
-  private readonly runtimePath = defaultRuntimePath;
   private worker: Worker | null = null;
   private reqId = 1;
   private workerExited = false;
@@ -187,18 +208,52 @@ export class MonacoNeovimClient {
   private cursorRefreshInFlight = false;
   private cursorRefreshPending = false;
   private disposables: monaco.IDisposable[] = [];
+  private nvimChannelId: number | null = null;
+  private hostAutocmdInstalled = false;
+  private visualSelectionRefreshTimer: number | null = null;
   private lastCursorStyle: MonacoEditor.IStandaloneEditorConstructionOptions["cursorStyle"] | null = null;
   private lastCursorBlink: MonacoEditor.IStandaloneEditorConstructionOptions["cursorBlinking"] | null = null;
   private lastCursorWidth: number | null = null;
   private initialCursorWidth = 0;
   private typicalFullWidth = 2;
   private nextSeedLines: string[] | null = null;
+  private cmdlineEl: HTMLDivElement | null = null;
+  private cmdlineVisible = false;
+  private messageEl: HTMLDivElement | null = null;
+  private messageTimer: number | null = null;
+  private popupEl: HTMLDivElement | null = null;
+  private popupItems: PopupMenuItem[] = [];
+  private popupSelected = -1;
+  private preeditEl: HTMLDivElement | null = null;
+  private preeditVisible = false;
+  private compositionActive = false;
+  private pendingResyncAfterComposition = false;
+  private ignoreNextInputEvent = false;
+  private ignoreTextKeydownUntil = 0;
+  private optimisticCursorUntil = 0;
+  private optimisticCursorPos: monaco.Position | null = null;
+  private optimisticCursorPrevPos: monaco.Position | null = null;
+  private delegateInsertToMonaco = false;
+  private applyingFromNvim = false;
+  private shadowLines: string[] | null = null;
+  private pendingBufEdits: PendingBufSetText[] = [];
+  private pendingFullSync = false;
+  private pendingCursorSync = false;
+  private cursorSyncTimer: number | null = null;
+  private originalOptions: Partial<MonacoEditor.IStandaloneEditorConstructionOptions> | null = null;
+  private inputQueue: Uint8Array[] = [];
+  private inputQueueHead = 0;
+  private inputQueuedBytes = 0;
+  private inputFlushTimer: number | null = null;
+  private resyncTimer: number | null = null;
 
   constructor(editor: MonacoEditor.IStandaloneCodeEditor, options: MonacoNeovimOptions = {}) {
     this.editor = editor;
     this.opts = {
       worker: options.worker ?? null,
       workerUrl: options.workerUrl ?? new URL("./nvimWorker.js", import.meta.url),
+      wasmPath: options.wasmPath ?? defaultWasmPath,
+      runtimePath: options.runtimePath ?? defaultRuntimePath,
       sharedInputBytes: options.sharedInputBytes ?? DEFAULT_SHARED_INPUT_BYTES,
       cols: options.cols ?? 120,
       rows: options.rows ?? 40,
@@ -207,6 +262,11 @@ export class MonacoNeovimClient {
       visualThemeName: options.visualThemeName ?? "nvim-visual",
       rpcTimeoutMs: options.rpcTimeoutMs ?? 8000,
       onModeChange: options.onModeChange,
+      onCmdline: options.onCmdline,
+      onMessage: options.onMessage,
+      onPopupmenu: options.onPopupmenu,
+      cmdlineContainer: options.cmdlineContainer,
+      shouldHandleKey: options.shouldHandleKey ?? (() => true),
     };
   }
 
@@ -231,20 +291,20 @@ export class MonacoNeovimClient {
         type: "start",
         cols: this.opts.cols,
         rows: this.opts.rows,
-        wasmPath: this.wasmPath,
-        runtimePath: this.runtimePath,
+        wasmPath: this.opts.wasmPath,
+        runtimePath: this.opts.runtimePath,
         inputBuffer: this.sharedInput?.buffer,
       };
       const transfers: Transferable[] = [];
       try {
-        this.worker.postMessage(startMsg, transfers);
+      this.worker.postMessage(startMsg, transfers);
       } catch (_) {
         this.worker.postMessage({
           type: "start",
           cols: this.opts.cols,
           rows: this.opts.rows,
-          wasmPath: this.wasmPath,
-          runtimePath: this.runtimePath,
+          wasmPath: this.opts.wasmPath,
+          runtimePath: this.opts.runtimePath,
           inputBuffer: this.sharedInput?.buffer,
         });
       }
@@ -267,24 +327,69 @@ export class MonacoNeovimClient {
       this.worker = null;
     }
     this.sharedInput = null;
+    this.inputQueue = [];
+    this.inputQueueHead = 0;
+    this.inputQueuedBytes = 0;
+    if (this.inputFlushTimer) {
+      clearTimeout(this.inputFlushTimer);
+      this.inputFlushTimer = null;
+    }
     this.workerExited = false;
     this.workerExitCode = null;
     this.pending.clear();
     this.bufHandle = null;
     this.primeSent = false;
     this.visualSelectionActive = false;
+    this.delegateInsertToMonaco = false;
+    this.applyingFromNvim = false;
+    this.shadowLines = null;
+    this.pendingBufEdits = [];
+    this.pendingCursorSync = false;
+    if (this.cursorSyncTimer) {
+      clearTimeout(this.cursorSyncTimer);
+      this.cursorSyncTimer = null;
+    }
+    this.nvimChannelId = null;
+    this.hostAutocmdInstalled = false;
+    if (this.visualSelectionRefreshTimer) {
+      clearTimeout(this.visualSelectionRefreshTimer);
+      this.visualSelectionRefreshTimer = null;
+    }
     if (this.cursorRefreshTimer) {
       clearTimeout(this.cursorRefreshTimer);
       this.cursorRefreshTimer = null;
     }
     this.cursorRefreshPending = false;
     this.cursorRefreshInFlight = false;
+    this.setCmdline(null);
+    this.setMessage(null);
+    this.setPopupmenu(null, -1);
+    if (this.resyncTimer) {
+      clearTimeout(this.resyncTimer);
+      this.resyncTimer = null;
+    }
     if (!silent) this.opts.status("stopped", true);
     this.disposeEditorListeners();
   }
 
   dispose(): void {
     this.stop(true);
+  }
+
+  notify(method: string, params: unknown[] = []): void {
+    this.sendNotify(method, params);
+  }
+
+  call<T = unknown>(method: string, params: unknown[] = []): Promise<T> {
+    return this.rpcCall(method, params) as Promise<T>;
+  }
+
+  command(cmd: string): void {
+    this.sendNotify("nvim_command", [String(cmd ?? "")]);
+  }
+
+  execLua<T = unknown>(code: string, args: unknown[] = []): Promise<T> {
+    return this.rpcCall("nvim_exec_lua", [String(code ?? ""), Array.isArray(args) ? args : []]) as Promise<T>;
   }
 
   private attachEditorListeners(): void {
@@ -299,20 +404,54 @@ export class MonacoNeovimClient {
       this.typicalFullWidth = 2;
     }
 
-    this.editor.updateOptions({
-      readOnly: false,
-      contextmenu: false,
-      minimap: { enabled: false },
-      scrollBeyondLastLine: false,
-      smoothScrolling: true,
-      padding: { top: 12, bottom: 12 },
-      cursorSmoothCaretAnimation: "on",
-    });
+    if (this.originalOptions == null) {
+      try {
+        this.originalOptions = {
+          readOnly: this.editor.getOption(EditorOption.readOnly),
+          domReadOnly: this.editor.getOption(EditorOption.domReadOnly) as any,
+          contextmenu: this.editor.getOption(EditorOption.contextmenu),
+          minimap: this.editor.getOption(EditorOption.minimap),
+          scrollBeyondLastLine: this.editor.getOption(EditorOption.scrollBeyondLastLine),
+          smoothScrolling: this.editor.getOption(EditorOption.smoothScrolling),
+          padding: this.editor.getOption(EditorOption.padding),
+          cursorSmoothCaretAnimation: this.editor.getOption(EditorOption.cursorSmoothCaretAnimation),
+          cursorStyle: this.editor.getOption(EditorOption.cursorStyle) as any,
+          cursorBlinking: this.editor.getOption(EditorOption.cursorBlinking) as any,
+          cursorWidth: this.editor.getOption(EditorOption.cursorWidth),
+        };
+      } catch (_) {
+        this.originalOptions = null;
+      }
+    }
+
+    // Keep the editor writable so IME composition works correctly. We still
+    // prevent most keydown-driven edits and rely on Neovim as the source of truth.
+    this.editor.updateOptions({ readOnly: false, domReadOnly: false });
+
+    const model = this.editor.getModel();
+    if (model) {
+      this.disposables.push(
+        model.onDidChangeContent((ev) => this.handleMonacoModelChange(ev)),
+      );
+    }
 
     this.disposables.push(
       this.editor.onKeyDown((ev) => this.handleKey(ev)),
       this.editor.onMouseDown((ev) => this.handleMouse(ev)),
       this.editor.onDidChangeCursorPosition((ev) => {
+        const cur = this.editor.getPosition();
+        if (cur) this.lastCursorPos = cur;
+        if (this.delegateInsertToMonaco) {
+          if (this.compositionActive) this.positionPreedit();
+          this.scheduleCursorSyncToNvim();
+          return;
+        }
+        // During IME composition, Monaco moves its internal cursor/selection.
+        // Don't fight it, otherwise the view can glitch until composition ends.
+        if (this.compositionActive) {
+          this.positionPreedit();
+          return;
+        }
         if (this.suppressCursorSync || !this.lastCursorPos) return;
         if (ev.source === "keyboard") {
           this.suppressCursorSync = true;
@@ -320,22 +459,176 @@ export class MonacoNeovimClient {
           this.suppressCursorSync = false;
         }
       }),
+      this.editor.onDidScrollChange(() => {
+        if (!this.compositionActive) return;
+        this.positionPreedit();
+      }),
     );
+    this.initCmdlineUi();
+    this.initTextInputListeners();
+  }
+
+  private ensurePreeditUi(): void {
+    if (this.preeditEl) return;
+    const container = this.opts.cmdlineContainer ?? this.editor.getDomNode();
+    if (!container) return;
+    try {
+      const style = window.getComputedStyle(container);
+      if (style.position === "static") {
+        (container as HTMLElement).style.position = "relative";
+      }
+    } catch (_) {
+    }
+    const el = document.createElement("div");
+    el.style.position = "absolute";
+    el.style.display = "none";
+    el.style.pointerEvents = "none";
+    el.style.zIndex = "40";
+    el.style.whiteSpace = "pre";
+    el.style.padding = "0 1px";
+    el.style.background = "rgba(0, 0, 0, 0.15)";
+    el.style.borderBottom = "1px solid rgba(255, 255, 255, 0.6)";
+    el.style.borderRadius = "2px";
+    try {
+      const fontInfo = this.editor.getOption(monaco.editor.EditorOption.fontInfo);
+      if (fontInfo?.fontFamily) el.style.fontFamily = fontInfo.fontFamily;
+      if (fontInfo?.fontSize) el.style.fontSize = `${fontInfo.fontSize}px`;
+      if (fontInfo?.lineHeight) el.style.lineHeight = `${fontInfo.lineHeight}px`;
+    } catch (_) {
+    }
+    container.appendChild(el);
+    this.preeditEl = el;
+  }
+
+  private setPreedit(text: string | null): void {
+    this.ensurePreeditUi();
+    if (!this.preeditEl) return;
+    const t = text == null ? "" : String(text);
+    const nextVisible = t.length > 0;
+    if (!nextVisible) {
+      if (this.preeditVisible) {
+        this.preeditEl.style.display = "none";
+        this.preeditVisible = false;
+      }
+      this.preeditEl.textContent = "";
+      return;
+    }
+    this.preeditEl.textContent = t;
+    if (!this.preeditVisible) {
+      this.preeditEl.style.display = "block";
+      this.preeditVisible = true;
+    }
+    this.positionPreedit();
+  }
+
+  private applyOptimisticInsert(text: string): void {
+    if (!text) return;
+    if (this.cmdlineVisible) return;
+    const model = this.editor.getModel();
+    if (!model) return;
+    const selection = this.editor.getSelection();
+    const base = selection && !selection.isEmpty() ? selection.getStartPosition() : null;
+    const basePos = base ?? this.editor.getPosition() ?? this.lastCursorPos ?? new monaco.Position(1, 1);
+    const parts = String(text).split(/\r?\n/);
+    let line = basePos.lineNumber;
+    let col = basePos.column;
+    if (parts.length <= 1) {
+      col += Array.from(parts[0] ?? "").length;
+    } else {
+      line += parts.length - 1;
+      col = 1 + Array.from(parts[parts.length - 1] ?? "").length;
+    }
+    const next = model.validatePosition(new monaco.Position(line, col));
+    const prev = this.editor.getPosition() ?? this.lastCursorPos ?? basePos;
+    this.optimisticCursorPrevPos = prev;
+    this.optimisticCursorPos = next;
+    this.optimisticCursorUntil = (typeof performance !== "undefined" && performance.now ? performance.now() : Date.now()) + 120;
+    this.lastCursorPos = next;
+    if (this.compositionActive) return;
+    this.suppressCursorSync = true;
+    this.editor.setPosition(next);
+    this.suppressCursorSync = false;
+  }
+
+  private positionPreedit(): void {
+    if (!this.preeditEl || !this.preeditVisible) return;
+    const pos = this.editor.getPosition();
+    if (!pos) return;
+    const vis = this.editor.getScrolledVisiblePosition(pos);
+    if (!vis) return;
+    this.preeditEl.style.left = `${Math.max(0, vis.left)}px`;
+    this.preeditEl.style.top = `${Math.max(0, vis.top)}px`;
+    this.preeditEl.style.height = `${Math.max(0, vis.height)}px`;
   }
 
   private disposeEditorListeners(): void {
     this.disposables.forEach((d) => d.dispose());
     this.disposables = [];
+    if (this.cmdlineEl) {
+      try { this.cmdlineEl.remove(); } catch (_) {}
+      this.cmdlineEl = null;
+    }
+    if (this.messageEl) {
+      try { this.messageEl.remove(); } catch (_) {}
+      this.messageEl = null;
+    }
+    if (this.popupEl) {
+      try { this.popupEl.remove(); } catch (_) {}
+      this.popupEl = null;
+    }
+    if (this.preeditEl) {
+      try { this.preeditEl.remove(); } catch (_) {}
+      this.preeditEl = null;
+      this.preeditVisible = false;
+    }
+    if (this.messageTimer) {
+      clearTimeout(this.messageTimer);
+      this.messageTimer = null;
+    }
+    if (this.resyncTimer) {
+      clearTimeout(this.resyncTimer);
+      this.resyncTimer = null;
+    }
+    this.compositionActive = false;
+    this.pendingResyncAfterComposition = false;
+    this.delegateInsertToMonaco = false;
+    this.applyingFromNvim = false;
+    this.shadowLines = null;
+    this.pendingBufEdits = [];
+    this.pendingCursorSync = false;
+    if (this.cursorSyncTimer) {
+      clearTimeout(this.cursorSyncTimer);
+      this.cursorSyncTimer = null;
+    }
+    this.nvimChannelId = null;
+    this.hostAutocmdInstalled = false;
+    if (this.visualSelectionRefreshTimer) {
+      clearTimeout(this.visualSelectionRefreshTimer);
+      this.visualSelectionRefreshTimer = null;
+    }
+    if (this.originalOptions) {
+      try { this.editor.updateOptions(this.originalOptions); } catch (_) {}
+      this.originalOptions = null;
+    }
   }
 
   private async primeSession(): Promise<void> {
     if (this.bufHandle) return;
     this.primeSent = true;
     try {
-      this.sendRpc("nvim_command", ["set noswapfile signcolumn=no number norelativenumber"]);
-      this.sendRpc("nvim_command", ["set nowrap laststatus=0 cmdheight=1"]);
-      this.sendRpc("nvim_command", ["set shortmess+=F"]);
-      this.sendRpc("nvim_command", ["set clipboard=unnamedplus"]);
+      try {
+        await this.rpcCall("nvim_ui_attach", [this.opts.cols, this.opts.rows, {
+          ext_cmdline: true,
+          ext_messages: true,
+          ext_popupmenu: true,
+          rgb: true,
+        }]);
+      } catch (_) {
+      }
+      this.sendNotify("nvim_command", ["set noswapfile signcolumn=no number norelativenumber"]);
+      this.sendNotify("nvim_command", ["set nowrap laststatus=0 cmdheight=1"]);
+      this.sendNotify("nvim_command", ["set shortmess+=F"]);
+      this.sendNotify("nvim_command", ["set clipboard=unnamedplus"]);
       const buf = await this.rpcCall("nvim_get_current_buf", []);
       const id = extractBufId(buf) ?? 1;
       this.bufHandle = id;
@@ -346,7 +639,7 @@ export class MonacoNeovimClient {
       const seeded = await this.seedBuffer(id, this.nextSeedLines);
       this.nextSeedLines = null;
       if (seeded && seeded.length) this.applyBuffer(seeded);
-      await this.refreshCursorMode();
+      await this.installHostAutocmds();
       await this.syncVisualSelectionColor();
       if (!this.lastMode) this.lastMode = "n";
       this.opts.status("ready");
@@ -410,19 +703,458 @@ export class MonacoNeovimClient {
   }
 
   private async handleNotify(method: string, params: unknown[]): Promise<void> {
+    if (method === "monaco_cursor") {
+      const [ln, col0] = params;
+      const clamped = clampCursor(this.editor, Number(ln), Number(col0));
+      // In insert-mode delegation, Monaco owns the caret; don't overwrite it.
+      if (this.delegateInsertToMonaco) {
+        const model = this.editor.getModel();
+        const validated = model
+          ? model.validatePosition(new monaco.Position(clamped.line, clamped.col))
+          : new monaco.Position(clamped.line, clamped.col);
+        this.lastCursorPos = validated;
+        return;
+      }
+      this.updateCursor(clamped.line, clamped.col);
+      if (isVisualMode(this.lastMode)) this.scheduleVisualSelectionRefresh();
+      return;
+    }
+    if (method === "monaco_mode") {
+      const m = typeof params?.[0] === "string" ? String(params[0]) : "";
+      this.applyNvimMode(m);
+      return;
+    }
     if (method === "nvim_buf_lines_event") {
-      const [buf] = params;
+      if (this.delegateInsertToMonaco) return;
+      const [buf, _changedtick, firstline, lastline, linedata] = params;
       const id = extractBufId(buf);
       if (this.bufHandle != null && id === this.bufHandle) {
-        try {
-          const allLines = await this.rpcCall("nvim_buf_get_lines", [id, 0, -1, false]);
-          this.applyBuffer(Array.isArray(allLines) ? (allLines as string[]) : [""]);
-        } catch (_) {
+        if (this.compositionActive) {
+          // Don't mutate the Monaco model during IME composition; it can cause the
+          // IME rendering/caret to glitch. We'll resync after composition ends.
+          this.pendingResyncAfterComposition = true;
+          return;
         }
-        await this.refreshCursorMode();
+        const model = this.editor.getModel();
+        const fl = Number(firstline);
+        const ll = Number(lastline);
+        const newLines = Array.isArray(linedata) ? (linedata as unknown[]).map((l) => String(l ?? "")) : null;
+        const canPatch = model && Number.isInteger(fl) && Number.isInteger(ll) && fl >= 0 && ll >= fl && newLines;
+        if (canPatch) {
+          try {
+            this.applyLinePatch(model!, fl, ll, newLines!);
+          } catch (_) {
+          }
+        } else {
+          try {
+            const allLines = await this.rpcCall("nvim_buf_get_lines", [id, 0, -1, false]);
+            this.applyBuffer(Array.isArray(allLines) ? (allLines as string[]) : [""]);
+          } catch (_) {
+          }
+        }
+        if (isVisualMode(this.lastMode)) this.scheduleVisualSelectionRefresh();
       }
     } else if (method === "nvim_buf_detach_event") {
       this.bufHandle = null;
+    } else if (method === "redraw") {
+      this.handleRedraw(params);
+    }
+  }
+
+  private applyLinePatch(model: monaco.editor.ITextModel, firstline: number, lastline: number, newLines: string[]): void {
+    const oldLineCount = model.getLineCount();
+    const fl = Math.min(firstline, oldLineCount);
+    const ll = Math.min(lastline, oldLineCount);
+    const pos = this.lastCursorPos ?? this.editor.getPosition() ?? new monaco.Position(1, 1);
+
+    const eof = new monaco.Position(oldLineCount, model.getLineMaxColumn(oldLineCount));
+    const start = fl < oldLineCount ? new monaco.Position(fl + 1, 1) : eof;
+    const end = ll < oldLineCount ? new monaco.Position(ll + 1, 1) : eof;
+
+    let text = newLines.join("\n");
+    const insertingAtEof = firstline >= oldLineCount && lastline >= oldLineCount;
+    if (insertingAtEof && newLines.length > 0) text = `\n${text}`;
+    const hasFollowingLine = lastline < oldLineCount;
+    if (hasFollowingLine && newLines.length > 0) text += "\n";
+
+    const range = new monaco.Range(start.lineNumber, start.column, end.lineNumber, end.column);
+    try {
+      const existing = model.getValueInRange(range);
+      if (existing === text) return;
+    } catch (_) {
+    }
+
+    this.suppressCursorSync = true;
+    this.applyingFromNvim = true;
+    model.applyEdits([{ range, text }]);
+    this.applyingFromNvim = false;
+    if (pos) this.editor.setPosition(pos);
+    this.suppressCursorSync = false;
+
+    if (this.delegateInsertToMonaco) {
+      // Keep our shadow in sync if Neovim changed the buffer while delegating.
+      try { this.shadowLines = model.getLinesContent(); } catch (_) {}
+    }
+  }
+
+  private initCmdlineUi(): void {
+    if (this.opts.cmdlineContainer === null) return;
+    if (this.cmdlineEl || this.messageEl || this.popupEl) return;
+    const container = this.opts.cmdlineContainer ?? this.editor.getDomNode();
+    if (!container) return;
+    try {
+      const style = window.getComputedStyle(container);
+      if (style.position === "static") {
+        (container as HTMLElement).style.position = "relative";
+      }
+    } catch (_) {
+    }
+    const baseFont = "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
+    const baseSize = "12px";
+    const baseLine = "1.4";
+
+    if (!this.opts.onCmdline) {
+      const el = document.createElement("div");
+      el.style.position = "absolute";
+      el.style.left = "0";
+      el.style.right = "0";
+      el.style.bottom = "0";
+      el.style.padding = "6px 10px";
+      el.style.fontFamily = baseFont;
+      el.style.fontSize = baseSize;
+      el.style.lineHeight = baseLine;
+      el.style.background = "rgba(0, 0, 0, 0.72)";
+      el.style.color = "#ddd";
+      el.style.borderTop = "1px solid rgba(255, 255, 255, 0.08)";
+      el.style.whiteSpace = "pre";
+      el.style.display = "none";
+      el.style.pointerEvents = "none";
+      el.style.zIndex = "20";
+      container.appendChild(el);
+      this.cmdlineEl = el;
+    }
+
+    if (!this.opts.onMessage) {
+      const msg = document.createElement("div");
+      msg.style.position = "absolute";
+      msg.style.left = "0";
+      msg.style.right = "0";
+      msg.style.bottom = "34px";
+      msg.style.padding = "6px 10px";
+      msg.style.fontFamily = baseFont;
+      msg.style.fontSize = baseSize;
+      msg.style.lineHeight = baseLine;
+      msg.style.background = "rgba(0, 0, 0, 0.55)";
+      msg.style.color = "#ddd";
+      msg.style.whiteSpace = "pre-wrap";
+      msg.style.display = "none";
+      msg.style.pointerEvents = "none";
+      msg.style.zIndex = "19";
+      container.appendChild(msg);
+      this.messageEl = msg;
+    }
+
+    if (!this.opts.onPopupmenu) {
+      const pop = document.createElement("div");
+      pop.style.position = "absolute";
+      pop.style.left = "12px";
+      pop.style.bottom = "34px";
+      pop.style.maxHeight = "40%";
+      pop.style.overflow = "auto";
+      pop.style.minWidth = "240px";
+      pop.style.padding = "4px 0";
+      pop.style.fontFamily = baseFont;
+      pop.style.fontSize = baseSize;
+      pop.style.lineHeight = baseLine;
+      pop.style.background = "rgba(0, 0, 0, 0.88)";
+      pop.style.border = "1px solid rgba(255, 255, 255, 0.12)";
+      pop.style.borderRadius = "6px";
+      pop.style.color = "#ddd";
+      pop.style.whiteSpace = "pre";
+      pop.style.display = "none";
+      pop.style.pointerEvents = "none";
+      pop.style.zIndex = "21";
+      container.appendChild(pop);
+      this.popupEl = pop;
+    }
+  }
+
+  private setCmdline(text: string | null): void {
+    if (this.opts.onCmdline) {
+      try { this.opts.onCmdline(text); } catch (_) {}
+    }
+    if (!this.cmdlineEl) return;
+    if (text == null || text === "") {
+      this.cmdlineEl.textContent = "";
+      this.cmdlineEl.style.display = "none";
+      this.cmdlineVisible = false;
+      return;
+    }
+    this.cmdlineEl.textContent = text;
+    this.cmdlineEl.style.display = "block";
+    this.cmdlineVisible = true;
+  }
+
+  private setMessage(text: string | null): void {
+    if (this.opts.onMessage) {
+      try { this.opts.onMessage(text); } catch (_) {}
+    }
+    if (!this.messageEl) return;
+    if (this.messageTimer) {
+      clearTimeout(this.messageTimer);
+      this.messageTimer = null;
+    }
+    if (text == null || text === "") {
+      this.messageEl.textContent = "";
+      this.messageEl.style.display = "none";
+      return;
+    }
+    this.messageEl.textContent = text;
+    this.messageEl.style.display = "block";
+    this.messageTimer = window.setTimeout(() => {
+      this.messageTimer = null;
+      this.setMessage(null);
+    }, 4000);
+  }
+
+  private setPopupmenu(items: PopupMenuItem[] | null, selected: number): void {
+    this.popupItems = items ?? [];
+    this.popupSelected = selected;
+    if (this.opts.onPopupmenu) {
+      try { this.opts.onPopupmenu(items, selected); } catch (_) {}
+    }
+    if (!this.popupEl) return;
+    if (!items || !items.length) {
+      this.popupEl.textContent = "";
+      this.popupEl.style.display = "none";
+      return;
+    }
+    this.popupEl.innerHTML = "";
+    for (let i = 0; i < items.length; i += 1) {
+      const it = items[i];
+      const row = document.createElement("div");
+      row.style.padding = "2px 10px";
+      row.style.display = "flex";
+      row.style.gap = "10px";
+      row.style.justifyContent = "space-between";
+      row.style.background = i === selected ? "rgba(255,255,255,0.12)" : "transparent";
+      const left = document.createElement("span");
+      left.textContent = it.word ?? "";
+      const right = document.createElement("span");
+      right.style.opacity = "0.7";
+      right.textContent = it.menu ?? it.kind ?? "";
+      row.appendChild(left);
+      row.appendChild(right);
+      this.popupEl.appendChild(row);
+    }
+    this.popupEl.style.display = "block";
+  }
+
+  private updatePopupmenuSelection(selected: number): void {
+    if (this.popupSelected === selected) return;
+    this.popupSelected = selected;
+    if (this.opts.onPopupmenu) {
+      try { this.opts.onPopupmenu(this.popupItems, selected); } catch (_) {}
+      return;
+    }
+    if (!this.popupEl) return;
+    const children = Array.from(this.popupEl.children) as HTMLElement[];
+    for (let i = 0; i < children.length; i += 1) {
+      children[i].style.background = i === selected ? "rgba(255,255,255,0.12)" : "transparent";
+    }
+  }
+
+  private handleRedraw(params: unknown[]): void {
+    if (!Array.isArray(params)) return;
+    for (const batch of params) {
+      if (!Array.isArray(batch) || batch.length === 0) continue;
+      const name = batch[0];
+      if (typeof name !== "string") continue;
+      const rawArgs = batch.slice(1);
+      const args = rawArgs.length === 1 && Array.isArray(rawArgs[0]) ? (rawArgs[0] as unknown[]) : rawArgs;
+      if (name === "cmdline_hide") {
+        this.setCmdline(null);
+        continue;
+      }
+      if (name === "cmdline_show") {
+        const content = args[0];
+        const firstc = typeof args[2] === "string" ? args[2] : "";
+        const prompt = typeof args[3] === "string" ? args[3] : "";
+        const indent = Math.max(0, Number(args[4] ?? 0) || 0);
+        const prefix = prompt ? prompt : (firstc || "");
+        const text = `${" ".repeat(indent)}${prefix}${uiChunksToText(content)}`;
+        this.setCmdline(text);
+        continue;
+      }
+      if (name === "msg_clear") {
+        this.setMessage(null);
+        continue;
+      }
+      if (name === "msg_show") {
+        const kind = typeof args[0] === "string" ? args[0] : "";
+        const content = args[1];
+        const replaceLast = Boolean(args[2]);
+        const append = Boolean(args[4]);
+        const text = uiChunksToText(content);
+        if (kind === "empty" && !text) {
+          this.setMessage(null);
+          continue;
+        }
+        if (!text) continue;
+        if (append && this.messageEl?.textContent) {
+          this.setMessage(`${this.messageEl.textContent}${text}`);
+          continue;
+        }
+        if (replaceLast) {
+          this.setMessage(text);
+          continue;
+        }
+        this.setMessage(text);
+        continue;
+      }
+      if (name === "msg_showmode" || name === "msg_showcmd" || name === "msg_ruler") {
+        const content = args[0];
+        const text = uiChunksToText(content);
+        this.setMessage(text || null);
+        continue;
+      }
+      if (name === "popupmenu_hide") {
+        this.setPopupmenu(null, -1);
+        continue;
+      }
+      if (name === "popupmenu_show") {
+        const itemsRaw = args[0];
+        const selected = Number(args[1] ?? -1);
+        const items = parsePopupmenuItems(itemsRaw);
+        this.setPopupmenu(items, Number.isFinite(selected) ? selected : -1);
+        continue;
+      }
+      if (name === "popupmenu_select") {
+        const selected = Number(args[0] ?? -1);
+        this.updatePopupmenuSelection(Number.isFinite(selected) ? selected : -1);
+        continue;
+      }
+      if (name === "mode_change") {
+        const mode = typeof args[0] === "string" ? args[0] : "";
+        this.applyNvimMode(mode);
+        continue;
+      }
+    }
+  }
+
+  private initTextInputListeners(): void {
+    const root = this.editor.getDomNode();
+    if (!root) return;
+    const inputs = Array.from(root.querySelectorAll("textarea.inputarea")) as HTMLTextAreaElement[];
+    if (!inputs.length) return;
+
+    const nowMs = () => (typeof performance !== "undefined" && performance.now ? performance.now() : Date.now());
+
+    const stopAll = (e: Event) => {
+      try { (e as any).stopImmediatePropagation?.(); } catch (_) {}
+      try { e.stopPropagation(); } catch (_) {}
+    };
+
+    const onCompositionStart = () => {
+      this.compositionActive = true;
+      if (this.delegateInsertToMonaco) {
+        this.setPreedit(null);
+        return;
+      }
+      this.setPreedit("");
+    };
+    const onCompositionEndStateOnly = () => {
+      this.compositionActive = false;
+      this.setPreedit(null);
+    };
+    const onCompositionEnd = (e: CompositionEvent) => {
+      this.compositionActive = false;
+      this.setPreedit(null);
+      if (this.delegateInsertToMonaco) {
+        this.scheduleCursorSyncToNvim();
+        return;
+      }
+      const target = e.target as HTMLTextAreaElement | null;
+      try { if (target) target.value = ""; } catch (_) {}
+      if (this.pendingResyncAfterComposition) {
+        this.pendingResyncAfterComposition = false;
+        this.scheduleResync();
+      }
+    };
+    const onCompositionUpdate = (e: CompositionEvent) => {
+      if (!this.compositionActive) this.compositionActive = true;
+      if (this.delegateInsertToMonaco) return;
+      const target = e.target as HTMLTextAreaElement | null;
+      const data = typeof e.data === "string" ? e.data : (target?.value ? String(target.value) : "");
+      this.setPreedit(data || "");
+    };
+    const onBeforeInput = (e: Event) => {
+      if (this.delegateInsertToMonaco) return;
+      // Prevent Monaco from turning IME/text input events into model edits; Neovim
+      // remains the source of truth and we re-render from nvim_buf_lines_event.
+      stopAll(e);
+    };
+    const onInput = (e: Event) => {
+      if (this.delegateInsertToMonaco) return;
+      stopAll(e);
+      const ie = e as InputEvent;
+      const target = ie.target as HTMLTextAreaElement | null;
+
+      if (this.ignoreNextInputEvent) {
+        this.ignoreNextInputEvent = false;
+        try { if (target) target.value = ""; } catch (_) {}
+        return;
+      }
+      if (this.compositionActive) return;
+
+      try { if (target) target.value = ""; } catch (_) {}
+    };
+    const onPaste = (e: ClipboardEvent) => {
+      if (this.delegateInsertToMonaco) return;
+      stopAll(e);
+      const text = e.clipboardData?.getData("text/plain") ?? "";
+      if (text) {
+        e.preventDefault();
+        this.pasteText(text);
+      }
+      try { (e.target as HTMLTextAreaElement | null)?.value && ((e.target as HTMLTextAreaElement).value = ""); } catch (_) {}
+    };
+
+    this.disposables.push(
+      // Capture phase to ensure we see events even if Monaco stops propagation.
+      domListener(root, "compositionstart", onCompositionStart, true),
+      domListener(root, "compositionupdate", onCompositionUpdate, true),
+      domListener(root, "compositionend", onCompositionEndStateOnly, true),
+    );
+
+    for (const input of inputs) {
+      this.disposables.push(
+        domListener(input, "beforeinput", onBeforeInput, true),
+        domListener(input, "input", onInput, true),
+        domListener(input, "compositionstart", (e) => { onCompositionStart(); void e; }, true),
+        domListener(input, "compositionupdate", (e) => { onCompositionUpdate(e as CompositionEvent); }, true),
+        domListener(input, "compositionend", (e) => { onCompositionEnd(e as CompositionEvent); }, true),
+        domListener(input, "paste", onPaste, true),
+      );
+    }
+  }
+
+  private scheduleResync(): void {
+    if (this.resyncTimer) return;
+    this.resyncTimer = window.setTimeout(() => {
+      this.resyncTimer = null;
+      void this.resyncBufferFromNvim();
+    }, 50);
+  }
+
+  private async resyncBufferFromNvim(): Promise<void> {
+    if (this.compositionActive) return;
+    if (!this.worker || this.workerExited) return;
+    if (!this.bufHandle) return;
+    try {
+      const lines = await this.rpcCall("nvim_buf_get_lines", [this.bufHandle, 0, -1, false]);
+      this.applyBuffer(Array.isArray(lines) ? (lines as string[]) : [""]);
+    } catch (_) {
     }
   }
 
@@ -433,31 +1165,273 @@ export class MonacoNeovimClient {
     if (model.getValue() === joined) return;
     const pos = this.lastCursorPos ?? this.editor.getPosition() ?? new monaco.Position(1, 1);
     this.suppressCursorSync = true;
+    this.applyingFromNvim = true;
     model.setValue(joined);
+    this.applyingFromNvim = false;
     if (pos) this.editor.setPosition(pos);
     this.suppressCursorSync = false;
+    if (this.delegateInsertToMonaco) {
+      try { this.shadowLines = model.getLinesContent(); } catch (_) {}
+    }
+  }
+
+  private applyNvimMode(mode: string): void {
+    const m = typeof mode === "string" ? mode : "";
+    if (!m || m === this.lastMode) return;
+    this.lastMode = m;
+
+    const nextDelegate = isInsertLike(m);
+    if (nextDelegate !== this.delegateInsertToMonaco) {
+      this.delegateInsertToMonaco = nextDelegate;
+      if (nextDelegate) {
+        this.setPreedit(null);
+        this.shadowLines = this.editor.getModel()?.getLinesContent() ?? null;
+        this.pendingBufEdits = [];
+        this.pendingFullSync = false;
+        this.pendingCursorSync = false;
+      } else {
+        if (this.pendingBufEdits.length || this.pendingCursorSync || this.pendingFullSync) {
+          this.flushPendingMonacoSync();
+        }
+        this.shadowLines = null;
+        this.pendingBufEdits = [];
+        this.pendingFullSync = false;
+        this.pendingCursorSync = false;
+      }
+    }
+
+    this.applyCursorStyle(m);
+    if (this.opts.onModeChange) this.opts.onModeChange(m);
+    void this.updateVisualSelection(m);
   }
 
   private handleKey(ev: monaco.IKeyboardEvent): void {
-    const key = translateKey(ev.browserEvent as KeyboardEvent);
+    const browserEvent = ev.browserEvent as KeyboardEvent;
+    if (browserEvent.defaultPrevented && browserEvent.key !== "Escape") return;
+    if (this.delegateInsertToMonaco) {
+      // While delegating insert-mode typing to Monaco (IME-friendly), only
+      // forward "command-like" keys to Neovim after syncing Monaco -> Neovim.
+      if (browserEvent.key === "Escape") {
+        ev.preventDefault();
+        this.flushPendingMonacoSync();
+        this.sendInput("<Esc>");
+        return;
+      }
+      if (!this.opts.shouldHandleKey(browserEvent)) return;
+      if (browserEvent.ctrlKey || browserEvent.altKey || browserEvent.metaKey) {
+        const key = translateKey(browserEvent);
+        if (!key) return;
+        ev.preventDefault();
+        this.flushPendingMonacoSync();
+        this.sendInput(key);
+        return;
+      }
+      return;
+    }
+    if (
+      this.ignoreTextKeydownUntil > 0
+      && (typeof browserEvent.key === "string" && browserEvent.key.length === 1)
+      && !browserEvent.ctrlKey
+      && !browserEvent.metaKey
+      && !browserEvent.altKey
+      && (typeof performance !== "undefined" && performance.now ? performance.now() : Date.now()) < this.ignoreTextKeydownUntil
+    ) {
+      return;
+    }
+    // IME: don't intercept Process/229 events; they are part of composition flow.
+    if (browserEvent.key === "Process" || (browserEvent as any).keyCode === 229) {
+      this.compositionActive = true;
+      return;
+    }
+    if (this.compositionActive || browserEvent.isComposing) return;
+    if (!this.opts.shouldHandleKey(browserEvent)) return;
+    const key = translateKey(browserEvent);
     if (!key) return;
+    // Some browsers still dispatch an `input` event even if we preventDefault on
+    // keydown. Ignore the next `input` to avoid double-sending text.
+    this.ignoreNextInputEvent = true;
     ev.preventDefault();
     this.sendInput(key);
   }
 
   private handleMouse(ev: monaco.editor.IEditorMouseEvent): void {
+    if (this.delegateInsertToMonaco) return;
     if (!this.bufHandle || !ev.target?.position) return;
     const { lineNumber, column } = ev.target.position;
-    this.sendRpc("nvim_win_set_cursor", [0, [lineNumber, column]]);
+    const model = this.editor.getModel();
+    const charCol0 = Math.max(0, column - 1);
+    const text = model ? (model.getLineContent(lineNumber) ?? "") : "";
+    const byteCol0 = model ? charIndexToByteIndex(text, charCol0) : charCol0;
+    this.sendNotify("nvim_win_set_cursor", [0, [lineNumber, byteCol0]]);
   }
 
   private sendInput(keys: string): void {
-    this.sendRpc("nvim_input", [keys]);
-    this.scheduleCursorRefresh();
+    this.sendNotify("nvim_input", [keys]);
   }
 
-  private sendRpc(method: string, params: unknown[] = []): void {
-    const msg = encode([0, this.reqId++, method, params] as any);
+  private pasteText(text: string): void {
+    const payload = String(text ?? "");
+    if (!payload) return;
+    const crlf = payload.includes("\r\n");
+    this.sendNotify("nvim_paste", [payload, crlf, -1]);
+  }
+
+  private handleMonacoModelChange(ev: monaco.editor.IModelContentChangedEvent): void {
+    if (!this.delegateInsertToMonaco) return;
+    if (this.applyingFromNvim) return;
+    if (!this.worker || this.workerExited) return;
+    if (!this.bufHandle) return;
+    const model = this.editor.getModel();
+    if (!model) return;
+
+    if (!this.shadowLines) {
+      // We don't have a reliable pre-change snapshot; fall back to full sync.
+      this.pendingFullSync = true;
+      this.pendingCursorSync = true;
+      this.shadowLines = model.getLinesContent();
+      this.scheduleFlushPendingMonacoSync();
+      return;
+    }
+
+    if (!ev.changes || ev.changes.length !== 1) {
+      this.pendingFullSync = true;
+      this.pendingCursorSync = true;
+      this.shadowLines = model.getLinesContent();
+      this.scheduleFlushPendingMonacoSync();
+      return;
+    }
+
+    const change = ev.changes[0];
+    const range = change.range;
+    const startRow = range.startLineNumber - 1;
+    const endRow = range.endLineNumber - 1;
+    if (startRow < 0 || endRow < 0) return;
+    if (this.shadowLines[startRow] == null || this.shadowLines[endRow] == null) {
+      this.pendingFullSync = true;
+      this.pendingCursorSync = true;
+      this.shadowLines = model.getLinesContent();
+      this.scheduleFlushPendingMonacoSync();
+      return;
+    }
+
+    const oldStartLine = this.shadowLines[startRow] ?? "";
+    const oldEndLine = this.shadowLines[endRow] ?? "";
+    const startColChar = Math.max(0, range.startColumn - 1);
+    const endColChar = Math.max(0, range.endColumn - 1);
+    const startColByte = charIndexToByteIndex(oldStartLine, startColChar);
+    const endColByte = charIndexToByteIndex(oldEndLine, endColChar);
+    const text = String(change.text ?? "");
+    const lines = text.length ? text.split(/\r?\n/) : [];
+
+    this.pendingBufEdits.push({ startRow, startColByte, endRow, endColByte, lines });
+    applyShadowLinesChange(this.shadowLines, startRow, startColChar, endRow, endColChar, text);
+
+    this.pendingCursorSync = true;
+    this.scheduleFlushPendingMonacoSync();
+  }
+
+  private scheduleCursorSyncToNvim(): void {
+    if (!this.delegateInsertToMonaco) return;
+    this.pendingCursorSync = true;
+    this.scheduleFlushPendingMonacoSync();
+  }
+
+  private scheduleFlushPendingMonacoSync(): void {
+    if (this.cursorSyncTimer) return;
+    this.cursorSyncTimer = window.setTimeout(() => {
+      this.cursorSyncTimer = null;
+      this.flushPendingMonacoSync();
+    }, 0);
+  }
+
+  private flushPendingMonacoSync(): void {
+    if (!this.worker || this.workerExited) return;
+    if (!this.bufHandle) return;
+    const model = this.editor.getModel();
+    if (!model) return;
+
+    if (this.pendingFullSync) {
+      const lines = model.getLinesContent();
+      this.sendNotify("nvim_buf_set_lines", [this.bufHandle, 0, -1, false, lines]);
+      this.pendingFullSync = false;
+      this.pendingBufEdits = [];
+      this.shadowLines = lines.slice();
+    } else if (this.pendingBufEdits.length) {
+      for (const edit of this.pendingBufEdits) {
+        this.sendNotify("nvim_buf_set_text", [this.bufHandle, edit.startRow, edit.startColByte, edit.endRow, edit.endColByte, edit.lines]);
+      }
+      this.pendingBufEdits = [];
+    }
+
+    if (this.pendingCursorSync) {
+      this.pendingCursorSync = false;
+      this.syncCursorToNvimNow();
+    }
+  }
+
+  private syncCursorToNvimNow(): void {
+    if (!this.worker || this.workerExited) return;
+    if (!this.bufHandle) return;
+    const model = this.editor.getModel();
+    const pos = this.editor.getPosition();
+    if (!model || !pos) return;
+    const lineNumber = pos.lineNumber;
+    const text = model.getLineContent(lineNumber) ?? "";
+    const byteCol0 = charIndexToByteIndex(text, Math.max(0, pos.column - 1));
+    this.sendNotify("nvim_win_set_cursor", [0, [lineNumber, byteCol0]]);
+  }
+
+  private scheduleVisualSelectionRefresh(): void {
+    if (this.visualSelectionRefreshTimer) return;
+    this.visualSelectionRefreshTimer = window.setTimeout(() => {
+      this.visualSelectionRefreshTimer = null;
+      void this.updateVisualSelection(this.lastMode || "n");
+    }, 16);
+  }
+
+  private async installHostAutocmds(): Promise<void> {
+    if (this.hostAutocmdInstalled) return;
+    try {
+      const info = await this.rpcCall("nvim_get_api_info", []);
+      const chan = Array.isArray(info) ? Number(info[0]) : NaN;
+      if (!Number.isFinite(chan) || chan <= 0) return;
+      this.nvimChannelId = chan;
+      const lua = `
+local chan = ...
+local api = vim.api
+
+local function send_cursor()
+  local cur = api.nvim_win_get_cursor(0)
+  vim.rpcnotify(chan, "monaco_cursor", cur[1], cur[2])
+end
+
+local function send_mode()
+  local m = api.nvim_get_mode().mode or ""
+  vim.rpcnotify(chan, "monaco_mode", m)
+end
+
+local group = api.nvim_create_augroup("MonacoNeovimWasm", { clear = true })
+api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
+  group = group,
+  callback = function() send_cursor() end,
+})
+api.nvim_create_autocmd({ "ModeChanged", "InsertEnter", "InsertLeave" }, {
+  group = group,
+  callback = function() send_mode(); send_cursor() end,
+})
+
+send_mode()
+send_cursor()
+`;
+      await this.rpcCall("nvim_exec_lua", [lua, [chan]]);
+      this.hostAutocmdInstalled = true;
+    } catch (_) {
+    }
+  }
+
+  private sendNotify(method: string, params: unknown[] = []): void {
+    if (!this.worker || this.workerExited) return;
+    const msg = encode([2, method, params] as any);
     this.postInput(msg);
   }
 
@@ -492,7 +1466,59 @@ export class MonacoNeovimClient {
   private postInput(data: Uint8Array): void {
     if (!data || !data.buffer) return;
     const payload = normalizeTransfer(data);
-    if (this.sharedInput) this.sharedInput.push(payload);
+    if (!this.sharedInput) return;
+    if (this.inputQueueHead >= this.inputQueue.length) {
+      const ok = this.sharedInput.push(payload);
+      if (ok) return;
+    }
+    this.enqueueInput(payload);
+  }
+
+  private enqueueInput(payload: Uint8Array): void {
+    if (!this.sharedInput) return;
+    this.inputQueue.push(payload);
+    this.inputQueuedBytes += payload.byteLength;
+    const maxQueued = 4 * 1024 * 1024;
+    if (this.inputQueuedBytes > maxQueued) {
+      this.opts.status("input queue overflow (ring buffer too small); dropping queued input", true);
+      this.inputQueue = [];
+      this.inputQueueHead = 0;
+      this.inputQueuedBytes = 0;
+      return;
+    }
+    this.scheduleFlushInput();
+  }
+
+  private scheduleFlushInput(): void {
+    if (this.inputFlushTimer) return;
+    this.inputFlushTimer = window.setTimeout(() => {
+      this.inputFlushTimer = null;
+      this.flushInputQueue();
+    }, 0);
+  }
+
+  private flushInputQueue(): void {
+    if (!this.sharedInput || this.inputQueueHead >= this.inputQueue.length) return;
+    while (this.inputQueueHead < this.inputQueue.length) {
+      const next = this.inputQueue[this.inputQueueHead];
+      const ok = this.sharedInput.push(next);
+      if (!ok) break;
+      this.inputQueueHead += 1;
+      this.inputQueuedBytes -= next.byteLength;
+    }
+    if (this.inputQueueHead > 64 && this.inputQueueHead > (this.inputQueue.length / 2)) {
+      this.inputQueue = this.inputQueue.slice(this.inputQueueHead);
+      this.inputQueueHead = 0;
+    }
+    if (this.inputQueueHead < this.inputQueue.length) {
+      this.inputFlushTimer = window.setTimeout(() => {
+        this.inputFlushTimer = null;
+        this.flushInputQueue();
+      }, 2);
+    } else {
+      this.inputQueue = [];
+      this.inputQueueHead = 0;
+    }
   }
 
   private doClipboardPaste(msgid: number): void {
@@ -510,14 +1536,18 @@ export class MonacoNeovimClient {
       .catch(() => fallback(""));
   }
 
-  private updateCursor(line: number, col: number): void {
-    const pos = clampCursor(this.editor, line, col - 1);
-    const ln = pos.line;
-    const cl = pos.col;
-    this.lastCursorPos = new monaco.Position(ln, cl);
+  private updateCursor(lineNumber: number, column: number): void {
+    const model = this.editor.getModel();
+    const ln = Math.max(1, Number(lineNumber) || 1);
+    const cl = Math.max(1, Number(column) || 1);
+    const validated = model
+      ? model.validatePosition(new monaco.Position(ln, cl))
+      : new monaco.Position(ln, cl);
+    this.lastCursorPos = validated;
+    if (this.compositionActive) return;
     if (!this.visualSelectionActive) {
       const current = this.editor.getPosition();
-      const same = current && current.lineNumber === ln && current.column === cl;
+      const same = current && current.lineNumber === validated.lineNumber && current.column === validated.column;
       if (!same) {
         this.suppressCursorSync = true;
         this.editor.setPosition(this.lastCursorPos);
@@ -528,37 +1558,70 @@ export class MonacoNeovimClient {
   }
 
   private scheduleCursorRefresh(): void {
+    if (this.compositionActive) return;
     if (this.cursorRefreshTimer) return;
+    const now = (typeof performance !== "undefined" && performance.now ? performance.now() : Date.now());
+    const delay = this.optimisticCursorUntil > now ? Math.max(30, Math.min(180, this.optimisticCursorUntil - now)) : 30;
     this.cursorRefreshTimer = window.setTimeout(() => {
       this.cursorRefreshTimer = null;
       void this.refreshCursorMode();
-    }, 30);
+    }, delay);
   }
 
   private async refreshCursorMode(): Promise<void> {
+    if (this.compositionActive) return;
+    const now = (typeof performance !== "undefined" && performance.now ? performance.now() : Date.now());
+    if (this.optimisticCursorUntil > now) {
+      // Avoid overwriting an optimistic caret update with a stale poll result.
+      this.scheduleCursorRefresh();
+      return;
+    }
     if (this.cursorRefreshInFlight) {
       this.cursorRefreshPending = true;
       return;
     }
     this.cursorRefreshInFlight = true;
     try {
-      const [cursor, mode] = await Promise.all([
-        this.rpcCall("nvim_win_get_cursor", [0]),
-        this.rpcCall("nvim_get_mode", []),
-      ]);
+      const cursor = await this.rpcCall("nvim_win_get_cursor", [0]);
       if (Array.isArray(cursor) && cursor.length >= 2) {
         const ln = Number(cursor[0]);
         const col0 = Number(cursor[1]);
         const clamped = clampCursor(this.editor, ln, col0);
-        this.updateCursor(clamped.line, clamped.col);
+        const next = new monaco.Position(clamped.line, clamped.col);
+        const now2 = (typeof performance !== "undefined" && performance.now ? performance.now() : Date.now());
+        if (this.optimisticCursorPos && this.optimisticCursorUntil > now2) {
+          const prev = this.optimisticCursorPrevPos;
+          if (prev && next.lineNumber === prev.lineNumber && next.column === prev.column) {
+            // Still seeing the old cursor; keep optimistic.
+          } else if (next.lineNumber < this.optimisticCursorPos.lineNumber
+            || (next.lineNumber === this.optimisticCursorPos.lineNumber && next.column < this.optimisticCursorPos.column)) {
+            // Cursor moved backwards relative to optimistic position; likely stale.
+          } else {
+            this.optimisticCursorPos = null;
+            this.optimisticCursorPrevPos = null;
+            this.optimisticCursorUntil = 0;
+            this.updateCursor(next.lineNumber, next.column);
+          }
+        } else {
+          this.optimisticCursorPos = null;
+          this.optimisticCursorPrevPos = null;
+          this.optimisticCursorUntil = 0;
+          this.updateCursor(next.lineNumber, next.column);
+        }
       }
-      if (mode && typeof (mode as { mode?: string }).mode === "string") {
-        const m = (mode as { mode: string }).mode;
-        this.lastMode = m;
-        this.applyCursorStyle(m);
-        if (this.opts.onModeChange) this.opts.onModeChange(m);
+      if (!this.lastMode) {
+        try {
+          const mode = await this.rpcCall("nvim_get_mode", []);
+          if (mode && typeof (mode as { mode?: string }).mode === "string") {
+            const m = (mode as { mode: string }).mode;
+            this.lastMode = m;
+            this.applyCursorStyle(m);
+            if (this.opts.onModeChange) this.opts.onModeChange(m);
+          }
+        } catch (_) {
+        }
       }
-      await this.updateVisualSelection(this.lastMode);
+      await this.updateVisualSelection(this.lastMode || "n");
     } catch (err) {
       void err;
     } finally {
@@ -714,33 +1777,50 @@ function clampCursor(editor: MonacoEditor.IStandaloneCodeEditor, ln: number, col
 
 function translateKey(ev: KeyboardEvent): string | null {
   const key = ev.key;
-  const isCtrl = ev.ctrlKey || ev.metaKey;
+  if (!key || key === "Dead" || key === "Unidentified") return null;
+
+  const isCtrl = ev.ctrlKey;
   const isAlt = ev.altKey;
+  const isMeta = ev.metaKey;
+  const isShift = ev.shiftKey;
+
+  const withMods = (name: string, includeShift = false) => {
+    const all: string[] = [];
+    if (isCtrl) all.push("C-");
+    if (includeShift && isShift) all.push("S-");
+    if (isAlt) all.push("A-");
+    if (isMeta) all.push("D-");
+    return all.length ? `<${all.join("")}${name}>` : `<${name}>`;
+  };
+
   switch (key) {
-    case "Backspace": return "<BS>";
-    case "Enter": return "<CR>";
-    case "Escape": return "<Esc>";
-    case "Tab": return "<Tab>";
-    case "ArrowUp": return "<Up>";
-    case "ArrowDown": return "<Down>";
-    case "ArrowLeft": return "<Left>";
-    case "ArrowRight": return "<Right>";
-    case "Delete": return "<Del>";
-    case "Home": return "<Home>";
-    case "End": return "<End>";
-    case "PageUp": return "<PageUp>";
-    case "PageDown": return "<PageDown>";
-    case "Insert": return "<Insert>";
+    case "Backspace": return withMods("BS", true);
+    case "Enter": return withMods("CR", true);
+    case "Escape": return withMods("Esc", true);
+    case "Tab": return isShift && !isCtrl && !isAlt && !isMeta ? "<S-Tab>" : withMods("Tab", true);
+    case "ArrowUp": return withMods("Up", true);
+    case "ArrowDown": return withMods("Down", true);
+    case "ArrowLeft": return withMods("Left", true);
+    case "ArrowRight": return withMods("Right", true);
+    case "Delete": return withMods("Del", true);
+    case "Home": return withMods("Home", true);
+    case "End": return withMods("End", true);
+    case "PageUp": return withMods("PageUp", true);
+    case "PageDown": return withMods("PageDown", true);
+    case "Insert": return withMods("Insert", true);
     default: break;
   }
+
+  if (/^F\d{1,2}$/.test(key)) return withMods(key, true);
+
   if (key.length === 1) {
-    const char = ev.shiftKey ? key : key.toLowerCase();
-    if (!isCtrl && !isAlt) return char;
-    let mod = "";
-    if (isCtrl) mod += "C-";
-    if (isAlt) mod += "A-";
-    return `<${mod}${char}>`;
+    if (!isCtrl && !isAlt && !isMeta) return key;
+    if (key === " " && isCtrl && !isAlt && !isMeta) return "<Nul>";
+    const ch = /^[A-Za-z]$/.test(key) ? key.toLowerCase() : key;
+    const prefix = (isCtrl ? "C-" : "") + (isAlt ? "A-" : "") + (isMeta ? "D-" : "");
+    return `<${prefix}${ch}>`;
   }
+
   return null;
 }
 
@@ -800,6 +1880,19 @@ function byteIndexToCharIndex(text: string, byteIndex: number): number {
     charIndex += bytes === 4 ? 2 : 1;
   }
   return charIndex;
+}
+
+function charIndexToByteIndex(text: string, charIndex: number): number {
+  const target = Math.max(0, Number(charIndex) || 0);
+  let bytes = 0;
+  let i = 0;
+  while (i < target && i < text.length) {
+    const code = text.codePointAt(i);
+    const b = utf8ByteLength(code ?? 0);
+    bytes += b;
+    i += b === 4 ? 2 : 1;
+  }
+  return bytes;
 }
 
 function utf8ByteLength(point: number): number {
@@ -877,6 +1970,101 @@ function normalizeHlBg(hl: unknown): string | null {
 function toHex(n: number): string {
   const v = Number(n >>> 0);
   return `#${v.toString(16).padStart(6, "0").slice(-6)}`;
+}
+
+function domListener<E extends Event>(
+  target: EventTarget,
+  type: string,
+  handler: (ev: E) => void,
+  options?: AddEventListenerOptions | boolean,
+): monaco.IDisposable {
+  target.addEventListener(type, handler as EventListener, options);
+  return { dispose: () => target.removeEventListener(type, handler as EventListener, options) };
+}
+
+function isInsertLike(mode: string): boolean {
+  const m = typeof mode === "string" ? mode : "";
+  return m.startsWith("i") || m.startsWith("R");
+}
+
+function applyShadowLinesChange(
+  lines: string[],
+  startRow: number,
+  startCol: number,
+  endRow: number,
+  endCol: number,
+  text: string,
+): void {
+  const beforeLine = lines[startRow] ?? "";
+  const afterLine = lines[endRow] ?? "";
+  const prefix = beforeLine.slice(0, Math.max(0, startCol));
+  const suffix = afterLine.slice(Math.max(0, endCol));
+  const inserted = String(text ?? "");
+  const parts = inserted.split(/\r?\n/);
+
+  let replacement: string[];
+  if (parts.length <= 1) {
+    replacement = [`${prefix}${parts[0] ?? ""}${suffix}`];
+  } else {
+    const first = `${prefix}${parts[0] ?? ""}`;
+    const last = `${parts[parts.length - 1] ?? ""}${suffix}`;
+    const middle = parts.slice(1, -1);
+    replacement = [first, ...middle, last];
+  }
+
+  lines.splice(startRow, Math.max(0, endRow - startRow + 1), ...replacement);
+}
+
+function uiChunksToText(content: unknown): string {
+  if (!content) return "";
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  let out = "";
+  for (const part of content) {
+    if (typeof part === "string") {
+      out += part;
+      continue;
+    }
+    if (Array.isArray(part)) {
+      // Neovim UI chunks are typically [attr_id|attrs, text_chunk, hl_id].
+      if (typeof part[1] === "string") {
+        out += part[1];
+      } else if (typeof part[0] === "string") {
+        // Back-compat for older/simple chunk shapes.
+        out += part[0];
+      } else {
+        out += uiChunksToText(part);
+      }
+      continue;
+    }
+    if (part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string") {
+      out += (part as { text: string }).text;
+    }
+  }
+  return out;
+}
+
+function parsePopupmenuItems(items: unknown): PopupMenuItem[] {
+  if (!Array.isArray(items)) return [];
+  const out: PopupMenuItem[] = [];
+  for (const it of items) {
+    if (Array.isArray(it)) {
+      out.push({
+        word: String(it[0] ?? ""),
+        kind: it[1] == null ? undefined : String(it[1]),
+        menu: it[2] == null ? undefined : String(it[2]),
+        info: it[3] == null ? undefined : String(it[3]),
+      });
+      continue;
+    }
+    if (it && typeof it === "object") {
+      const obj = it as Record<string, unknown>;
+      const word = obj.word ?? obj.abbr ?? obj.text;
+      if (word != null) out.push({ word: String(word), kind: obj.kind ? String(obj.kind) : undefined, menu: obj.menu ? String(obj.menu) : undefined, info: obj.info ? String(obj.info) : undefined });
+    }
+  }
+  return out.filter((x) => x.word.length > 0);
 }
 
 function normalizeTransfer(data: Uint8Array): Uint8Array {
