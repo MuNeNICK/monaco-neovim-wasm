@@ -319,6 +319,9 @@ function handleMessage(msg: unknown) {
       || method === "redraw"
       || method === "monaco_cursor"
       || method === "monaco_mode"
+      || method === "monaco_cursorMove"
+      || method === "monaco_reveal"
+      || method === "monaco_moveCursor"
     ) {
       postMessage({ type: "rpc-notify", method, params });
     }

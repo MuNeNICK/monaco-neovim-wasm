@@ -23,6 +23,30 @@ await client.start();
 - If you host assets separately, set `wasmPath`/`runtimePath`.
 - To customize startup, use `startupCommands` / `startupLua`, and seed via `seedLines` / `seedFiletype` / `seedName`.
 - Clipboard can be customized or disabled with `clipboard` (or set `clipboard: null`).
+- For accurate wrapped-motion like `gj`/`gk`/`g0`/`g$`, enable Neovim `set wrap` and set `syncWrap: true` + `wrappedLineMotions: true` (uses Monaco wrapped-line movement as a workaround, similar to vscode-neovim).
+- For scroll/reveal motions like `zt`/`zz`/`zb` (and cursor-to-screen-line `H`/`M`/`L`), set `scrollMotions: true` (delegates viewport positioning to Monaco and optionally moves cursor for `z<CR>`/`z.`/`z-`).
+
+## Loading Vimscript overrides (vscode-neovim style)
+This package injects its host-aware mappings via `nvim_exec_lua` so it can stay a single JS dependency (no extra `.vim` files, no `runtimepath` surgery).
+
+If you prefer to keep overrides as Vimscript files (like `vscode-motion.vim` / `vscode-scrolling.vim`), you can still do that by placing files into the in-memory FS and `:source`-ing them via startup hooks:
+```ts
+const client = createMonacoNeovim(editor, {
+  files: [
+    {
+      // becomes /nvim/home/.config/nvim/overrides.vim inside Neovim
+      path: "home/.config/nvim/overrides.vim",
+      data: `
+nnoremap gj <Cmd>call rpcnotify(g:monaco_neovim_wasm_chan, "monaco_cursorMove", { "to": "down", "by": "wrappedLine", "value": v:count1 })<CR>
+`,
+    },
+  ],
+  startupCommands: [
+    "source $HOME/.config/nvim/overrides.vim",
+  ],
+});
+```
+Note: Neovim is launched with `-u NORC --noplugin`, so it won’t auto-load your config unless you explicitly `:source` it.
 
 ## Session-only (non-Monaco) usage
 If you want a reusable building block for other editors (or headless automation), use `NeovimWasmSession`:

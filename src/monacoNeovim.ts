@@ -25,6 +25,11 @@ export type MonacoNeovimOptions = {
   minRows?: number;
   autoResize?: boolean;
   resizeDebounceMs?: number;
+  syncWrap?: boolean;
+  wrapStrategy?: "simple" | "advanced";
+  syncTabstop?: boolean;
+  wrappedLineMotions?: boolean;
+  scrollMotions?: boolean;
   status?: StatusEmitter;
   seedLines?: string[];
   seedName?: string;
@@ -71,6 +76,11 @@ type MonacoNeovimResolvedOptions = {
   minRows: number;
   autoResize: boolean;
   resizeDebounceMs: number;
+  syncWrap: boolean;
+  wrapStrategy: "simple" | "advanced";
+  syncTabstop: boolean;
+  wrappedLineMotions: boolean;
+  scrollMotions: boolean;
   status: StatusEmitter;
   seedLines: string[];
   seedName: string;
@@ -213,6 +223,8 @@ export class MonacoNeovimClient {
   private uiCols = 0;
   private uiRows = 0;
   private resizeTimer: number | null = null;
+  private wrapColumnApplied: number | null = null;
+  private wrapStrategyApplied: "simple" | "advanced" | null = null;
   private primeSent = false;
   private lastCursorPos: monaco.Position | null = null;
   private suppressCursorSync = false;
@@ -278,6 +290,11 @@ export class MonacoNeovimClient {
       minRows: options.minRows ?? 5,
       autoResize: options.autoResize ?? true,
       resizeDebounceMs: options.resizeDebounceMs ?? 50,
+      syncWrap: options.syncWrap ?? false,
+      wrapStrategy: options.wrapStrategy ?? "simple",
+      syncTabstop: options.syncTabstop ?? true,
+      wrappedLineMotions: options.wrappedLineMotions ?? (options.syncWrap ?? false),
+      scrollMotions: options.scrollMotions ?? false,
       status: options.status ?? (() => {}),
       seedLines: options.seedLines ?? DEFAULT_SEED,
       seedName: options.seedName ?? "monaco-demo.lua",
@@ -467,6 +484,7 @@ export class MonacoNeovimClient {
     const c = Math.max(this.opts.minCols, Number(cols) || 0);
     const r = Math.max(this.opts.minRows, Number(rows) || 0);
     if (!Number.isFinite(c) || !Number.isFinite(r) || c <= 0 || r <= 0) return;
+    if (this.opts.syncWrap) this.applyMonacoWrap(c);
     this.uiCols = c;
     this.uiRows = r;
     if (!this.session || !this.session.isRunning()) return;
@@ -505,6 +523,9 @@ export class MonacoNeovimClient {
           cursorStyle: this.editor.getOption(EditorOption.cursorStyle) as any,
           cursorBlinking: this.editor.getOption(EditorOption.cursorBlinking) as any,
           cursorWidth: this.editor.getOption(EditorOption.cursorWidth),
+          wordWrap: this.editor.getOption(EditorOption.wordWrap) as any,
+          wordWrapColumn: this.editor.getOption(EditorOption.wordWrapColumn) as any,
+          wrappingStrategy: this.editor.getOption(EditorOption.wrappingStrategy) as any,
         };
       } catch (_) {
         this.originalOptions = null;
@@ -514,6 +535,10 @@ export class MonacoNeovimClient {
     // Keep the editor writable so IME composition works correctly. We still
     // prevent most keydown-driven edits and rely on Neovim as the source of truth.
     this.editor.updateOptions({ readOnly: false, domReadOnly: false });
+    if (this.opts.syncWrap) {
+      const col = this.uiCols || this.opts.cols;
+      if (col > 0) this.applyMonacoWrap(col);
+    }
 
     const model = this.editor.getModel();
     if (model) {
@@ -774,6 +799,7 @@ export class MonacoNeovimClient {
       this.bufHandle = id;
       const attached = await this.rpcCall("nvim_buf_attach", [id, true, {}]);
       if (attached !== true) throw new Error("nvim_buf_attach failed");
+      if (this.opts.syncTabstop) this.syncTabstopFromMonaco();
       const lines = await this.rpcCall("nvim_buf_get_lines", [id, 0, -1, false]);
       this.applyBuffer(Array.isArray(lines) ? lines as string[] : [""]);
       const seeded = await this.seedBuffer(id, this.nextSeedLines);
@@ -811,6 +837,30 @@ export class MonacoNeovimClient {
   }
 
   private async handleNotify(method: string, params: unknown[]): Promise<void> {
+    if (method === "monaco_cursorMove") {
+      const arg = params?.[0];
+      if (arg && typeof arg === "object") {
+        this.applyMonacoCursorMove(arg as Record<string, unknown>);
+        this.syncCursorToNvimNow();
+      }
+      return;
+    }
+    if (method === "monaco_reveal") {
+      const arg = params?.[0];
+      if (arg && typeof arg === "object") {
+        const resetCursor = this.applyMonacoReveal(arg as Record<string, unknown>);
+        if (resetCursor) this.syncCursorToNvimNow();
+      }
+      return;
+    }
+    if (method === "monaco_moveCursor") {
+      const arg = params?.[0];
+      if (arg && typeof arg === "object") {
+        this.applyMonacoMoveCursor(arg as Record<string, unknown>);
+        this.syncCursorToNvimNow();
+      }
+      return;
+    }
     if (method === "monaco_cursor") {
       const [ln, col0] = params;
       const clamped = clampCursor(this.editor, Number(ln), Number(col0));
@@ -1056,6 +1106,143 @@ export class MonacoNeovimClient {
       this.popupEl.appendChild(row);
     }
     this.popupEl.style.display = "block";
+  }
+
+  private applyMonacoWrap(cols: number): void {
+    const c = Math.max(this.opts.minCols, Number(cols) || 0);
+    if (!Number.isFinite(c) || c <= 0) return;
+    const strategy = this.opts.wrapStrategy;
+    if (this.wrapColumnApplied === c && this.wrapStrategyApplied === strategy) return;
+    try {
+      this.editor.updateOptions({
+        wordWrap: "wordWrapColumn",
+        wordWrapColumn: c,
+        wrappingStrategy: strategy,
+      } as any);
+      this.wrapColumnApplied = c;
+      this.wrapStrategyApplied = strategy;
+    } catch (_) {
+    }
+  }
+
+  private applyMonacoCursorMove(arg: Record<string, unknown>): void {
+    const to = typeof arg.to === "string" ? arg.to : "";
+    const by = typeof arg.by === "string" ? arg.by : "";
+    const value = Math.max(1, Number(arg.value ?? 1) || 1);
+    if (!to) return;
+
+    const move = () => {
+      try {
+        this.editor.trigger("monaco-neovim-wasm", "cursorMove", { to, by, value } as any);
+        return true;
+      } catch (_) {
+      }
+      if (by === "wrappedLine" && (to === "down" || to === "up")) {
+        const action = to === "down" ? "cursorDown" : "cursorUp";
+        for (let i = 0; i < value; i += 1) {
+          try { this.editor.trigger("monaco-neovim-wasm", action, null); } catch (_) {}
+        }
+        return true;
+      }
+      return false;
+    };
+
+    this.suppressCursorSync = true;
+    void move();
+    const pos = this.editor.getPosition();
+    if (pos) this.lastCursorPos = pos;
+    this.suppressCursorSync = false;
+  }
+
+  private applyMonacoReveal(arg: Record<string, unknown>): boolean {
+    const direction = typeof arg.direction === "string" ? arg.direction : "";
+    const resetCursor = Boolean(arg.resetCursor);
+    const pos = this.editor.getPosition();
+    if (!pos) return false;
+    const line = pos.lineNumber;
+
+    const rows = Math.max(1, this.uiRows || this.opts.rows);
+    const fontInfo = this.editor.getOption(monaco.editor.EditorOption.fontInfo) as any;
+    const lineHeight = Math.max(1, Number(fontInfo?.lineHeight ?? 0) || 0);
+
+    this.suppressCursorSync = true;
+    try {
+      if (direction === "top") {
+        const top = this.editor.getTopForLineNumber(line);
+        this.editor.setScrollTop(top);
+      } else if (direction === "center") {
+        this.editor.revealLineInCenter(line);
+      } else if (direction === "bottom") {
+        const top = this.editor.getTopForLineNumber(line);
+        const target = Math.max(0, top - (rows - 1) * lineHeight);
+        this.editor.setScrollTop(target);
+      }
+
+      if (resetCursor) {
+        const model = this.editor.getModel();
+        if (model) {
+          const text = model.getLineContent(line) ?? "";
+          const m = /\S/.exec(text);
+          const col = m ? (m.index + 1) : 1;
+          const next = model.validatePosition(new monaco.Position(line, col));
+          this.editor.setPosition(next);
+          this.lastCursorPos = next;
+        }
+      }
+    } catch (_) {
+    }
+    this.suppressCursorSync = false;
+    return resetCursor;
+  }
+
+  private applyMonacoMoveCursor(arg: Record<string, unknown>): void {
+    const to = typeof arg.to === "string" ? arg.to : "";
+    if (!to) return;
+    const model = this.editor.getModel();
+    if (!model) return;
+
+    let top = 1;
+    let bottom = model.getLineCount();
+    try {
+      const ranges = this.editor.getVisibleRanges();
+      if (ranges && ranges.length) {
+        top = Math.min(...ranges.map((r) => r.startLineNumber));
+        bottom = Math.max(...ranges.map((r) => r.endLineNumber));
+      }
+    } catch (_) {
+    }
+    top = Math.max(1, Math.min(top, model.getLineCount()));
+    bottom = Math.max(1, Math.min(bottom, model.getLineCount()));
+    if (bottom < top) bottom = top;
+
+    let targetLine = top;
+    if (to === "top") {
+      targetLine = top;
+    } else if (to === "middle") {
+      targetLine = Math.floor((top + bottom) / 2);
+    } else if (to === "bottom") {
+      targetLine = bottom;
+    } else {
+      return;
+    }
+
+    const text = model.getLineContent(targetLine) ?? "";
+    const m = /\S/.exec(text);
+    const col = m ? (m.index + 1) : 1;
+    const next = model.validatePosition(new monaco.Position(targetLine, col));
+    this.suppressCursorSync = true;
+    try { this.editor.setPosition(next); } catch (_) {}
+    this.lastCursorPos = next;
+    this.suppressCursorSync = false;
+  }
+
+  private syncTabstopFromMonaco(): void {
+    const model = this.editor.getModel();
+    if (!model) return;
+    const anyModel = model as any;
+    const tabSize = Math.max(1, Number(anyModel.getOptions?.().tabSize ?? 4) || 4);
+    // Keep display width consistent across Neovim + Monaco for wrapped movement (gj/gk).
+    this.sendNotify("nvim_command", [`set tabstop=${tabSize} shiftwidth=${tabSize} softtabstop=${tabSize}`]);
   }
 
   private updatePopupmenuSelection(selected: number): void {
@@ -1585,9 +1772,12 @@ export class MonacoNeovimClient {
       const chan = Array.isArray(info) ? Number(info[0]) : NaN;
       if (!Number.isFinite(chan) || chan <= 0) return;
       this.nvimChannelId = chan;
-      const lua = `
+      const wrapped = this.opts.wrappedLineMotions ? "true" : "false";
+      const scroll = this.opts.scrollMotions ? "true" : "false";
+const lua = `
 local chan = ...
 local api = vim.api
+vim.g.monaco_neovim_wasm_chan = chan
 
 local function send_cursor()
   local cur = api.nvim_win_get_cursor(0)
@@ -1597,6 +1787,64 @@ end
 local function send_mode()
   local m = api.nvim_get_mode().mode or ""
   vim.rpcnotify(chan, "monaco_mode", m)
+end
+
+if ${wrapped} then
+  vim.keymap.set({ "n", "x", "o" }, "gj", function()
+    vim.rpcnotify(chan, "monaco_cursorMove", { to = "down", by = "wrappedLine", value = vim.v.count1 })
+  end, { silent = true })
+  vim.keymap.set({ "n", "x", "o" }, "gk", function()
+    vim.rpcnotify(chan, "monaco_cursorMove", { to = "up", by = "wrappedLine", value = vim.v.count1 })
+  end, { silent = true })
+  vim.keymap.set({ "n", "x", "o" }, "g0", function()
+    vim.rpcnotify(chan, "monaco_cursorMove", { to = "wrappedLineFirstNonWhitespaceCharacter" })
+  end, { silent = true })
+  vim.keymap.set({ "n", "x", "o" }, "g<Home>", function()
+    vim.rpcnotify(chan, "monaco_cursorMove", { to = "wrappedLineFirstNonWhitespaceCharacter" })
+  end, { silent = true })
+  vim.keymap.set({ "n", "x", "o" }, "g^", function()
+    vim.rpcnotify(chan, "monaco_cursorMove", { to = "wrappedLineFirstNonWhitespaceCharacter" })
+  end, { silent = true })
+  vim.keymap.set({ "n", "x", "o" }, "g$", function()
+    vim.rpcnotify(chan, "monaco_cursorMove", { to = "wrappedLineLastNonWhitespaceCharacter" })
+  end, { silent = true })
+  vim.keymap.set({ "n", "x", "o" }, "g<End>", function()
+    vim.rpcnotify(chan, "monaco_cursorMove", { to = "wrappedLineLastNonWhitespaceCharacter" })
+  end, { silent = true })
+end
+
+if ${scroll} then
+  vim.keymap.set({ "n", "x", "o" }, "zt", function()
+    vim.rpcnotify(chan, "monaco_reveal", { direction = "top", resetCursor = false })
+  end, { silent = true })
+  vim.keymap.set({ "n", "x", "o" }, "zz", function()
+    vim.rpcnotify(chan, "monaco_reveal", { direction = "center", resetCursor = false })
+  end, { silent = true })
+  vim.keymap.set({ "n", "x", "o" }, "zb", function()
+    vim.rpcnotify(chan, "monaco_reveal", { direction = "bottom", resetCursor = false })
+  end, { silent = true })
+  vim.keymap.set({ "n", "x", "o" }, "z<CR>", function()
+    vim.rpcnotify(chan, "monaco_reveal", { direction = "top", resetCursor = true })
+  end, { silent = true })
+  vim.keymap.set({ "n", "x", "o" }, "z.", function()
+    vim.rpcnotify(chan, "monaco_reveal", { direction = "center", resetCursor = true })
+  end, { silent = true })
+  vim.keymap.set({ "n", "x", "o" }, "z-", function()
+    vim.rpcnotify(chan, "monaco_reveal", { direction = "bottom", resetCursor = true })
+  end, { silent = true })
+
+  vim.keymap.set({ "n", "x", "o" }, "H", function()
+    vim.cmd("normal! m'")
+    vim.rpcnotify(chan, "monaco_moveCursor", { to = "top" })
+  end, { silent = true })
+  vim.keymap.set({ "n", "x", "o" }, "M", function()
+    vim.cmd("normal! m'")
+    vim.rpcnotify(chan, "monaco_moveCursor", { to = "middle" })
+  end, { silent = true })
+  vim.keymap.set({ "n", "x", "o" }, "L", function()
+    vim.cmd("normal! m'")
+    vim.rpcnotify(chan, "monaco_moveCursor", { to = "bottom" })
+  end, { silent = true })
 end
 
 local group = api.nvim_create_augroup("MonacoNeovimWasm", { clear = true })
