@@ -29,7 +29,7 @@ const editor = monaco.editor.create(editorHost, {
   minimap: { enabled: false },
   automaticLayout: true,
   smoothScrolling: true,
-  scrollBeyondLastLine: false,
+  scrollBeyondLastLine: true,
   padding: { top: 12, bottom: 12 },
   cursorSmoothCaretAnimation: "on",
 });
@@ -45,6 +45,8 @@ editor.onDidChangeModelContent(() => {
 const client = createMonacoNeovim(editor, {
   status: (text: string, warn?: boolean) => setStatus(text, !!warn),
   onModeChange: (mode: string) => { modeEl.textContent = `mode: ${mode}`; },
+  rpcTimeoutMs: 20_000,
+  scrollMotions: true,
 });
 
 let starting = false;
