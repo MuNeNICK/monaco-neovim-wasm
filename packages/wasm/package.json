@@ -1,11 +1,11 @@
 {
   "name": "@monaco-neovim-wasm/wasm",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "private": false,
   "type": "module",
   "description": "Batteries-included package: @monaco-neovim-wasm/lib + nvim.wasm + runtime (SharedArrayBuffer input).",
   "dependencies": {
-    "@monaco-neovim-wasm/lib": "0.1.6"
+    "@monaco-neovim-wasm/lib": "0.1.7"
   },
   "peerDependencies": {
     "monaco-editor": "^0.44.0"
@@ -27,4 +27,3 @@
     "package.json"
   ]
 }
-
