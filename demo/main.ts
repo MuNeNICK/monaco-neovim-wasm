@@ -45,8 +45,6 @@ editor.onDidChangeModelContent(() => {
 const client = createMonacoNeovim(editor, {
   status: (text: string, warn?: boolean) => setStatus(text, !!warn),
   onModeChange: (mode: string) => { modeEl.textContent = `mode: ${mode}`; },
-  rpcTimeoutMs: 20_000,
-  scrollMotions: true,
 });
 
 let starting = false;
