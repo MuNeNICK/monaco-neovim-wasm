@@ -446,7 +446,7 @@ export class MonacoNeovimClient {
       minRows: options.minRows ?? 5,
       autoResize: options.autoResize ?? true,
       resizeDebounceMs: options.resizeDebounceMs ?? 50,
-      syncWrap: options.syncWrap ?? false,
+      syncWrap: options.syncWrap ?? true,
       wrapStrategy: options.wrapStrategy ?? "simple",
       syncTabstop: options.syncTabstop ?? true,
       wrappedLineMotions: options.wrappedLineMotions ?? true,
