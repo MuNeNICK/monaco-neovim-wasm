@@ -1,11 +1,11 @@
 {
   "name": "@monaco-neovim-wasm/lib",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "private": false,
   "type": "module",
   "description": "Core library for running Neovim (WASM) behind Monaco via msgpack-RPC.",
   "scripts": {
-    "build": "vite build && vite build -c vite.worker.config.ts && npm run build:types",
+    "build": "vite build && vite build -c vite.worker.nvim.config.ts && vite build -c vite.worker.asyncify.config.ts && npm run build:types",
     "typecheck": "tsc --noEmit",
     "build:types": "tsc -p tsconfig.build.json"
   },
