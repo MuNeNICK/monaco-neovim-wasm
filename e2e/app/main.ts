@@ -1,6 +1,6 @@
 import * as monaco from "monaco-editor";
 import "monaco-editor/min/vs/editor/editor.main.css";
-import { createMonacoNeovim } from "../../packages/lib/src";
+import { createMonacoNeovim } from "@monaco-neovim-wasm/wasm-async";
 import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker&url";
 
 (self as any).MonacoEnvironment = {
@@ -29,17 +29,16 @@ const editor = monaco.editor.create(editorHost, {
 });
 editor.focus();
 
+function setStatus(text: string, warn = false) {
+  statusEl.textContent = String(text ?? "");
+  statusEl.className = warn ? "warn" : "ok";
+}
+
 const client = createMonacoNeovim(editor, {
-  worker: new Worker(new URL("../../packages/lib/src/nvimWorkerAsyncify.ts", import.meta.url), { type: "module" }),
-  inputMode: "message",
-  wasmPath: "/nvim-asyncify.wasm",
-  runtimePath: "/nvim-runtime.tar.gz",
   // GitHub Actions can be significantly slower at fetching/untar/gunzip + initial RPC.
   // Keep E2E robust by allowing more time before declaring RPC timeouts.
   rpcTimeoutMs: 30_000,
-  status: (text: string, warn?: boolean) => {
-    statusEl.textContent = warn ? `WARN: ${text}` : text;
-  },
+  status: setStatus,
   onModeChange: (mode: string) => { modeEl.textContent = `mode: ${mode}`; },
 });
 
@@ -47,13 +46,13 @@ const client = createMonacoNeovim(editor, {
 (window as any).monacoEditor = editor;
 
 async function start() {
-  statusEl.textContent = "starting...";
+  setStatus("starting...", false);
   try {
     await client.start([]);
-    statusEl.textContent = "ready";
+    setStatus("ready", false);
     editor.focus();
   } catch (err) {
-    statusEl.textContent = `start failed: ${(err as Error)?.message ?? err}`;
+    setStatus(`start failed: ${(err as Error)?.message ?? err}`, true);
   }
 }
 

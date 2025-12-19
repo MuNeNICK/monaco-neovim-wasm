@@ -17,10 +17,9 @@ export default defineConfig({
     strictPort: true,
   },
   optimizeDeps: {
-    exclude: ["@monaco-neovim-wasm/lib"],
+    exclude: ["@monaco-neovim-wasm/wasm-async", "@monaco-neovim-wasm/lib"],
   },
   worker: {
     format: "es",
   },
 });
-

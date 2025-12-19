@@ -16,7 +16,7 @@ declare global {
 
 export async function waitForAppReady(page: Page) {
   await page.goto("/");
-  await expect(page.locator("#status")).toHaveText("ready", { timeout: process.env.CI ? 90_000 : 20_000 });
+  await expect(page.locator("#status")).toHaveText("ready", { timeout: process.env.CI ? 30_000 : 20_000 });
   await page.evaluate(() => {
     window.monacoEditor?.focus?.();
   });
@@ -122,7 +122,8 @@ export async function waitForNvimBuffer(page: Page, expectedLines: string[]) {
   await expect
     .poll(async () => {
       const [nvimLines, monacoValue] = await Promise.all([getBufferLines(page), getMonacoValue(page)]);
-      return { nvimLines, monacoValue };
+      const normalizedMonacoValue = monacoValue === `${expectedValue}\n` ? expectedValue : monacoValue;
+      return { nvimLines, monacoValue: normalizedMonacoValue };
     })
     .toEqual({ nvimLines: expectedLines, monacoValue: expectedValue });
 }

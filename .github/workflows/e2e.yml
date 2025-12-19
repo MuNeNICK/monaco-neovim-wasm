@@ -22,9 +22,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Build @monaco-neovim-wasm/lib
+        run: npm -w @monaco-neovim-wasm/lib run build
+
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
 
       - name: Run e2e
         run: npm run test:e2e
-
