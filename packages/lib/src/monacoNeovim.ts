@@ -415,6 +415,9 @@ export class MonacoNeovimClient {
   private compositionActive = false;
   private pendingResyncAfterComposition = false;
   private ignoreNextInputEvent = false;
+  private exitingInsertMode = false;
+  private pendingKeysAfterExit = "";
+  private exitInsertTimer: number | null = null;
   private ignoreTextKeydownUntil = 0;
   private optimisticCursorUntil = 0;
   private optimisticCursorPos: monaco.Position | null = null;
@@ -602,6 +605,12 @@ export class MonacoNeovimClient {
     this.primeSent = false;
     this.visualSelectionActive = false;
     this.delegateInsertToMonaco = false;
+    this.exitingInsertMode = false;
+    this.pendingKeysAfterExit = "";
+    if (this.exitInsertTimer) {
+      clearTimeout(this.exitInsertTimer);
+      this.exitInsertTimer = null;
+    }
     this.applyingFromNvim = false;
     this.clearBufferStates();
     if (this.cursorSyncTimer) {
@@ -1869,7 +1878,7 @@ export class MonacoNeovimClient {
       if (!name) return;
       if (!this.opts.shouldHandleKey(e)) return;
 
-      const insertMode = this.delegateInsertToMonaco;
+      const insertMode = this.delegateInsertToMonaco && !this.exitingInsertMode;
       if (this.hasExplicitModAllowlist(insertMode)) {
         if (!this.shouldForwardModifiedKeys(e, insertMode)) return;
       } else {
@@ -1885,8 +1894,12 @@ export class MonacoNeovimClient {
       // Preempt Monaco keybindings (e.g. Ctrl+F find) and forward to Neovim.
       stopAll(e);
       try { e.preventDefault(); } catch (_) {}
-      if (insertMode) this.flushPendingMonacoSync();
-      this.sendInput(key);
+      if (this.exitingInsertMode) {
+        this.pendingKeysAfterExit += key;
+      } else {
+        if (insertMode) this.flushPendingMonacoSync();
+        this.sendInput(key);
+      }
     };
 
     const onCompositionStart = () => {
@@ -1923,13 +1936,13 @@ export class MonacoNeovimClient {
       this.setPreedit(data || "");
     };
     const onBeforeInput = (e: Event) => {
-      if (this.delegateInsertToMonaco) return;
+      if (this.delegateInsertToMonaco && !this.exitingInsertMode) return;
       // Prevent Monaco from turning IME/text input events into model edits; Neovim
       // remains the source of truth and we re-render from nvim_buf_lines_event.
       stopAll(e);
     };
     const onInput = (e: Event) => {
-      if (this.delegateInsertToMonaco) return;
+      if (this.delegateInsertToMonaco && !this.exitingInsertMode) return;
       stopAll(e);
       const ie = e as InputEvent;
       const target = ie.target as HTMLTextAreaElement | null;
@@ -1944,7 +1957,7 @@ export class MonacoNeovimClient {
       try { if (target) target.value = ""; } catch (_) {}
     };
     const onPaste = (e: ClipboardEvent) => {
-      if (this.delegateInsertToMonaco) return;
+      if (this.delegateInsertToMonaco && !this.exitingInsertMode) return;
       stopAll(e);
       const text = e.clipboardData?.getData("text/plain") ?? "";
       if (text) {
@@ -2246,20 +2259,72 @@ export class MonacoNeovimClient {
       }
     }
 
+    if (this.exitingInsertMode && !isInsertLike(m)) {
+      if (this.exitInsertTimer) {
+        clearTimeout(this.exitInsertTimer);
+        this.exitInsertTimer = null;
+      }
+      this.exitingInsertMode = false;
+      const pending = this.pendingKeysAfterExit;
+      this.pendingKeysAfterExit = "";
+      if (pending) this.sendInput(pending);
+    }
+
     this.applyCursorStyle(m);
     if (this.opts.onModeChange) this.opts.onModeChange(m);
     void this.updateVisualSelection(m);
     this.scheduleSearchHighlightRefresh();
   }
 
+  private armInsertExit(): void {
+    this.exitingInsertMode = true;
+    this.pendingKeysAfterExit = "";
+    if (this.exitInsertTimer) {
+      clearTimeout(this.exitInsertTimer);
+      this.exitInsertTimer = null;
+    }
+    // Fallback: if we don't observe a mode change soon, don't keep buffering forever.
+    this.exitInsertTimer = window.setTimeout(() => {
+      this.exitInsertTimer = null;
+      if (!this.exitingInsertMode) return;
+      this.exitingInsertMode = false;
+      const pending = this.pendingKeysAfterExit;
+      this.pendingKeysAfterExit = "";
+      if (pending) this.sendInput(pending);
+    }, 200);
+  }
+
   private handleKey(ev: monaco.IKeyboardEvent): void {
     const browserEvent = ev.browserEvent as KeyboardEvent;
     if (browserEvent.defaultPrevented && browserEvent.key !== "Escape") return;
+    if (this.exitingInsertMode) {
+      if (browserEvent.key === "Escape") {
+        ev.preventDefault();
+        return;
+      }
+      // IME: don't intercept Process/229 events; they are part of composition flow.
+      if (browserEvent.key === "Process" || (browserEvent as any).keyCode === 229) {
+        this.compositionActive = true;
+        return;
+      }
+      if (this.compositionActive || browserEvent.isComposing) return;
+      if (!this.opts.shouldHandleKey(browserEvent)) return;
+      if (this.hasExplicitModAllowlist(false)) {
+        if (!this.shouldForwardModifiedKeys(browserEvent, false)) return;
+      }
+      const key = this.opts.translateKey(browserEvent);
+      if (!key) return;
+      this.ignoreNextInputEvent = true;
+      ev.preventDefault();
+      this.pendingKeysAfterExit += key;
+      return;
+    }
     if (this.delegateInsertToMonaco) {
       // While delegating insert-mode typing to Monaco (IME-friendly), only
       // forward "command-like" keys to Neovim after syncing Monaco -> Neovim.
       if (browserEvent.key === "Escape") {
         ev.preventDefault();
+        this.armInsertExit();
         this.flushPendingMonacoSync();
         this.sendInput("<Esc>");
         return;
