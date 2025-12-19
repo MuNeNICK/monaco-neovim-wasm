@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { command, execLua, getBufferLines, getCursor, setBuffer, waitForAppReady, waitForCursor, waitForMode, waitForMonacoCursor, waitForNvimBuffer } from "./nvim";
+import { command, execLua, getBufferLines, getCursor, setBuffer, waitForAppReady, waitForCursor, waitForMode, waitForMonacoCursor, waitForMonacoVisualDecorations, waitForNoMonacoVisualDecorations, waitForNvimBuffer } from "./nvim";
 
 const keyDelayMs = 20;
 
@@ -102,6 +102,17 @@ test.describe("Monaco Neovim WASM - Vim E2E", () => {
     await waitForMode(page, "n");
     await page.keyboard.press("p");
     await waitForNvimBuffer(page, ["aabcbcdef"]);
+  });
+
+  test("visual: escape exits and clears decorations", async ({ page }) => {
+    await setBuffer(page, ["abcdef"]);
+    await page.keyboard.press("v");
+    await waitForMode(page, "v");
+    await page.keyboard.press("l");
+    await waitForMonacoVisualDecorations(page, 1);
+    await page.keyboard.press("Escape");
+    await waitForMode(page, "n");
+    await waitForNoMonacoVisualDecorations(page);
   });
 
   test("visual line selection + d", async ({ page }) => {
@@ -253,6 +264,17 @@ test.describe("Monaco Neovim WASM - Vim E2E", () => {
     await waitForNvimBuffer(page, ["three"]);
   });
 
+  test("normal: Backspace does not delete Monaco-only selection", async ({ page }) => {
+    await setBuffer(page, ["abcdef"]);
+    await page.evaluate(() => {
+      if (!window.monacoEditor) throw new Error("window.monacoEditor missing");
+      window.monacoEditor.setSelection({ startLineNumber: 1, startColumn: 2, endLineNumber: 1, endColumn: 5 } as any);
+    });
+    await page.keyboard.press("Backspace");
+    await waitForMode(page, "n");
+    await waitForNvimBuffer(page, ["abcdef"]);
+  });
+
   test("repeat: . (dot) after insert (including backspace)", async ({ page }) => {
     test.fail(true, "TODO: Monaco委譲のinsert入力ではNeovimの.が挿入文字列を記録できていない");
     await setBuffer(page, ["aaa bbb", "aaa bbb"]);
@@ -365,6 +387,7 @@ test.describe("Monaco Neovim WASM - Vim E2E", () => {
     await waitForMode(page, "\u0016");
     await page.keyboard.press("j");
     await page.keyboard.press("j");
+    await waitForMonacoVisualDecorations(page, 2);
     await page.keyboard.press("Shift+I");
     await waitForMode(page, "i");
     await page.keyboard.type("> ", { delay: keyDelayMs });
@@ -372,5 +395,6 @@ test.describe("Monaco Neovim WASM - Vim E2E", () => {
     await waitForNvimBuffer(page, ["> a", "> b", "> c"]);
     await page.keyboard.press("Escape");
     await waitForMode(page, "n");
+    await waitForNoMonacoVisualDecorations(page);
   });
 });

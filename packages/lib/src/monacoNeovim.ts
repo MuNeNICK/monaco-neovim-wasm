@@ -2007,6 +2007,25 @@ export class MonacoNeovimClient {
       if (this.compositionActive || e.isComposing) return;
       if (e.getModifierState?.("AltGraph")) return;
 
+      const insertMode = this.delegateInsertToMonaco && !this.exitingInsertMode;
+      if (
+        !insertMode
+        && (e.key === "Backspace" || e.key === "Delete" || e.key === "Escape")
+      ) {
+        if (!this.opts.shouldHandleKey(e)) return;
+        const key = this.opts.translateKey(e);
+        if (!key) return;
+        // Preempt Monaco edits/selection handling and forward to Neovim.
+        stopAll(e);
+        try { e.preventDefault(); } catch (_) {}
+        if (this.exitingInsertMode) {
+          this.pendingKeysAfterExit += key;
+        } else {
+          this.sendInput(key);
+        }
+        return;
+      }
+
       if (
         isCmdlineLike(this.lastMode)
         && !this.delegateInsertToMonaco
@@ -2031,7 +2050,6 @@ export class MonacoNeovimClient {
       if (!name) return;
       if (!this.opts.shouldHandleKey(e)) return;
 
-      const insertMode = this.delegateInsertToMonaco && !this.exitingInsertMode;
       if (this.hasExplicitModAllowlist(insertMode)) {
         if (!this.shouldForwardModifiedKeys(e, insertMode)) return;
       } else {
@@ -2397,6 +2415,7 @@ export class MonacoNeovimClient {
   private applyNvimMode(mode: string): void {
     const m = typeof mode === "string" ? mode : "";
     if (!m || m === this.lastMode) return;
+    const prevMode = this.lastMode;
     this.lastMode = m;
     if (isCmdlineLike(m)) this.ignoreNextInputEvent = false;
 
@@ -2443,6 +2462,20 @@ export class MonacoNeovimClient {
     this.applyCursorStyle(m);
     if (this.opts.onModeChange) this.opts.onModeChange(m);
     void this.updateVisualSelection(m);
+    if (isVisualMode(prevMode) && !isVisualMode(m)) {
+      // Monaco selection can persist even after leaving visual mode; clear it to
+      // avoid Monaco-only deletes (e.g. Backspace) and rely on decorations instead.
+      try {
+        const pos = this.editor.getPosition() ?? this.lastCursorPos;
+        if (pos && !this.compositionActive) {
+          this.suppressCursorSync = true;
+          this.editor.setSelection(new monaco.Selection(pos.lineNumber, pos.column, pos.lineNumber, pos.column));
+          this.suppressCursorSync = false;
+        }
+      } catch (_) {
+        this.suppressCursorSync = false;
+      }
+    }
     this.scheduleSearchHighlightRefresh();
   }
 
@@ -2746,7 +2779,16 @@ api.nvim_win_set_cursor(0, { b_line, b_col0 })
   }
 
   private handleMonacoModelChange(ev: monaco.editor.IModelContentChangedEvent): void {
-    if (!this.delegateInsertToMonaco) return;
+    if (!this.delegateInsertToMonaco) {
+      // In non-insert delegation, Neovim is the source of truth and Monaco edits
+      // are unexpected; force a resync to correct any transient/bad keybinding effects.
+      if (this.applyingFromNvim) return;
+      if (!this.session || !this.session.isRunning()) return;
+      if (!this.bufHandle) return;
+      if (this.compositionActive || (ev as any)?.isComposing) return;
+      if (ev?.changes?.length) this.scheduleResync();
+      return;
+    }
     if (this.applyingFromNvim) return;
     if (!this.session || !this.session.isRunning()) return;
     if (!this.bufHandle) return;
