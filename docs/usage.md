@@ -40,7 +40,7 @@ import { createMonacoNeovim } from "@monaco-neovim-wasm/wasm-async";
 ## API basics
 
 - Lifecycle: `await client.start()` / `client.stop()` / `client.dispose()`
-- Convenience helpers: `client.input(keys)` / `client.paste(text)` / `client.execLua(code)` / `client.command(cmd)`
+- Convenience helpers: `client.input(keys)` / `client.type(text)` / `client.paste(text)` / `client.execLua(code)` / `client.command(cmd)`
 - Session-only (non-Monaco): use `NeovimWasmSession` (see "Session-only usage" below)
 
 ## Common options
@@ -71,6 +71,27 @@ import { createMonacoNeovim } from "@monaco-neovim-wasm/wasm-async";
 - `altKeysForNormalMode` / `altKeysForInsertMode`: allowlist `Alt+key` forwarding
 - `metaKeysForNormalMode` / `metaKeysForInsertMode`: allowlist `Meta(Command)+key` forwarding
 - `translateKey(ev)`: override key → Neovim `<...>` translation
+- Note: a literal `<` must be sent as `<lt>` (the default `translateKey` handles this).
+- Note: use `shouldHandleKey` / `*KeysFor*Mode` to keep host shortcuts like paste (`Ctrl+V`) working.
+- Note: `client.input(keys)` expects Neovim key notation; to send literal text use `client.type(text)` (it escapes `<` and wraps newlines as `<CR>`).
+
+#### Recommended Ctrl allowlist defaults
+
+These are balanced defaults (Normal/Visual/Operator vs Insert):
+`Ctrl+V` works as visual-block in non-insert modes, while insert-mode paste stays available by default.
+
+```ts
+const ctrlKeysForNormalMode = [
+  "a","b","c","d","e","f","h","i","j","k","l","m","o","r","t","u","v","w","x","y","z",
+  "/",
+  "]",
+  "right","left","up","down",
+  "backspace","delete",
+];
+const ctrlKeysForInsertMode = ["a","c","d","h","j","m","o","r","t","u","w"];
+
+const client = createMonacoNeovim(editor, { ctrlKeysForNormalMode, ctrlKeysForInsertMode });
+```
 
 ### Wrapped lines / scrolling
 

@@ -660,6 +660,12 @@ export class MonacoNeovimClient {
     this.sendNotify("nvim_input", [String(keys ?? "")]);
   }
 
+  type(text: string, wrapEnter = true): void {
+    const payload = normalizeNvimInputText(String(text ?? ""), wrapEnter);
+    if (!payload) return;
+    this.sendNotify("nvim_input", [payload]);
+  }
+
   paste(text: string): void {
     this.pasteText(text);
   }
@@ -1867,10 +1873,11 @@ export class MonacoNeovimClient {
       if (this.hasExplicitModAllowlist(insertMode)) {
         if (!this.shouldForwardModifiedKeys(e, insertMode)) return;
       } else {
-        // Legacy behavior: only preempt the common scroll keys in normal/visual/operator modes.
+        // Legacy behavior: only preempt the common scroll keys (plus <C-v> for visual block)
+        // in normal/visual/operator modes.
         if (insertMode) return;
         if (!e.ctrlKey || e.altKey || e.metaKey) return;
-        if (name !== "f" && name !== "b" && name !== "d" && name !== "u" && name !== "e" && name !== "y") return;
+        if (name !== "f" && name !== "b" && name !== "d" && name !== "u" && name !== "e" && name !== "y" && name !== "v") return;
       }
 
       const key = this.opts.translateKey(e);
@@ -3030,6 +3037,15 @@ function clampCursor(editor: MonacoEditor.IStandaloneCodeEditor, ln: number, col
   return { line, col };
 }
 
+function normalizeNvimInputText(text: string, wrapEnter = true): string {
+  const payload = String(text ?? "");
+  if (!payload) return "";
+  // `nvim_input()` treats `<...>` as special key notation.
+  // For literal text input, escape `<` and optionally wrap newlines.
+  const escaped = payload.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/</g, "<lt>");
+  return wrapEnter ? escaped.replace(/\n/g, "<CR>") : escaped;
+}
+
 function translateKey(ev: KeyboardEvent): string | null {
   const key = ev.key;
   if (!key || key === "Dead" || key === "Unidentified") return null;
@@ -3039,13 +3055,19 @@ function translateKey(ev: KeyboardEvent): string | null {
   const isMeta = ev.metaKey;
   const isShift = ev.shiftKey;
 
+  // Neovim's nvim_input() parses `<...>` key notation, so a literal "<" must be
+  // escaped as `<lt>` to avoid being treated as the start of a keycode.
+  const normalizeSpecialKeyName = (name: string) => (name === "<" ? "lt" : name);
+  const normalizeLiteralChar = (ch: string) => (ch === "<" ? "<lt>" : ch);
+
   const withMods = (name: string, includeShift = false) => {
     const all: string[] = [];
     if (isCtrl) all.push("C-");
     if (includeShift && isShift) all.push("S-");
     if (isAlt) all.push("A-");
     if (isMeta) all.push("D-");
-    return all.length ? `<${all.join("")}${name}>` : `<${name}>`;
+    const normalized = normalizeSpecialKeyName(name);
+    return all.length ? `<${all.join("")}${normalized}>` : `<${normalized}>`;
   };
 
   switch (key) {
@@ -3069,11 +3091,12 @@ function translateKey(ev: KeyboardEvent): string | null {
   if (/^F\d{1,2}$/.test(key)) return withMods(key, true);
 
   if (key.length === 1) {
-    if (!isCtrl && !isAlt && !isMeta) return key;
+    if (!isCtrl && !isAlt && !isMeta) return normalizeLiteralChar(key);
     if (key === " " && isCtrl && !isAlt && !isMeta) return "<Nul>";
     const ch = /^[A-Za-z]$/.test(key) ? key.toLowerCase() : key;
+    const normalized = normalizeSpecialKeyName(ch);
     const prefix = (isCtrl ? "C-" : "") + (isAlt ? "A-" : "") + (isMeta ? "D-" : "");
-    return `<${prefix}${ch}>`;
+    return `<${prefix}${normalized}>`;
   }
 
   return null;

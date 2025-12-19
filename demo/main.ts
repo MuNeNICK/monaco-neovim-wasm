@@ -42,9 +42,22 @@ editor.onDidChangeModelContent(() => {
   if (snapshot && snapshot.length) cachedLines = snapshot;
 });
 
+// Suggested Ctrl allowlist defaults:
+// - In normal/visual/operator modes, forward common Ctrl motions (incl. Ctrl+V for visual block)
+// - In insert mode, keep host paste (Ctrl+V) working by default
+const ctrlKeysForNormalMode = [
+  "a", "b", "c", "d", "e", "f", "h", "i", "j", "k", "l", "m", "o", "r", "t", "u", "v", "w", "x", "y", "z",
+  "/", "]",
+  "right", "left", "up", "down",
+  "backspace", "delete",
+];
+const ctrlKeysForInsertMode = ["a", "c", "d", "h", "j", "m", "o", "r", "t", "u", "w"];
+
 const client = createMonacoNeovim(editor, {
   status: (text: string, warn?: boolean) => setStatus(text, !!warn),
   onModeChange: (mode: string) => { modeEl.textContent = `mode: ${mode}`; },
+  ctrlKeysForNormalMode,
+  ctrlKeysForInsertMode,
 });
 
 let starting = false;
