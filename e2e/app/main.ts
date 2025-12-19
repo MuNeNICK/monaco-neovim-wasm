@@ -35,9 +35,6 @@ function setStatus(text: string, warn = false) {
 }
 
 const client = createMonacoNeovim(editor, {
-  // GitHub Actions can be significantly slower at fetching/untar/gunzip + initial RPC.
-  // Keep E2E robust by allowing more time before declaring RPC timeouts.
-  rpcTimeoutMs: 30_000,
   status: setStatus,
   onModeChange: (mode: string) => { modeEl.textContent = `mode: ${mode}`; },
 });

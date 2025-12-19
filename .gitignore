@@ -6,6 +6,8 @@ packages/*/dist/
 npm-debug.log
 pnpm-debug.log
 *.tgz
+e2e/app/node_modules/
+e2e/app/.e2e-dist/
 
 # Playwright
 playwright-report/
