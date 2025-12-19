@@ -435,8 +435,9 @@ export class MonacoNeovimClient {
   private ignoreTextKeydownUntil = 0;
   private lastImeCommitAt = 0;
   private lastImeCommitText = "";
-  private cmdlinePendingTextCommit = "";
-  private cmdlinePendingTextTimer: number | null = null;
+  private recordingRegister = "";
+  private recordingRefreshArmed = false;
+  private recordingRefreshTimer: number | null = null;
   private optimisticCursorUntil = 0;
   private optimisticCursorPos: monaco.Position | null = null;
   private optimisticCursorPrevPos: monaco.Position | null = null;
@@ -459,39 +460,32 @@ export class MonacoNeovimClient {
     }
   }
 
+  private scheduleRecordingRefresh(): void {
+    if (this.recordingRefreshTimer) return;
+    this.recordingRefreshTimer = window.setTimeout(() => {
+      this.recordingRefreshTimer = null;
+      void this.refreshRecordingState();
+    }, 0);
+  }
+
+  private async refreshRecordingState(): Promise<void> {
+    if (!this.session || !this.session.isRunning()) return;
+    try {
+      const reg = await this.rpcCall("nvim_call_function", ["reg_recording", []]);
+      this.recordingRegister = typeof reg === "string" ? reg : String(reg ?? "");
+    } catch (_) {
+    }
+  }
+
   private sendCmdlineImeText(text: string): void {
     const payload = String(text ?? "");
     if (!payload) return;
     const now = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
-    if (payload === this.lastImeCommitText && (now - this.lastImeCommitAt) < 60) return;
+    if (payload.length > 1 && payload === this.lastImeCommitText && (now - this.lastImeCommitAt) < 60) return;
     this.lastImeCommitText = payload;
     this.lastImeCommitAt = now;
     this.sendInput(normalizeNvimInputText(payload, true));
     this.ignoreTextKeydownUntil = now + 60;
-  }
-
-  private deferCmdlineTextCommit(text: string): void {
-    if (!text) return;
-    this.cmdlinePendingTextCommit += String(text);
-    if (this.cmdlinePendingTextTimer) return;
-    this.cmdlinePendingTextTimer = window.setTimeout(() => {
-      this.cmdlinePendingTextTimer = null;
-      const pending = this.cmdlinePendingTextCommit;
-      this.cmdlinePendingTextCommit = "";
-      if (!pending) return;
-      if (!isCmdlineLike(this.lastMode)) return;
-      if (this.delegateInsertToMonaco) return;
-      if (this.compositionActive) return;
-      this.sendCmdlineImeText(pending);
-    }, 0);
-  }
-
-  private cancelDeferredCmdlineTextCommit(): void {
-    this.cmdlinePendingTextCommit = "";
-    if (this.cmdlinePendingTextTimer) {
-      clearTimeout(this.cmdlinePendingTextTimer);
-      this.cmdlinePendingTextTimer = null;
-    }
   }
 
   constructor(editor: MonacoEditor.IStandaloneCodeEditor, options: MonacoNeovimOptions = {}) {
@@ -671,13 +665,18 @@ export class MonacoNeovimClient {
     this.primeSent = false;
     this.visualSelectionActive = false;
     this.delegateInsertToMonaco = false;
+    this.recordingRegister = "";
+    this.recordingRefreshArmed = false;
+    if (this.recordingRefreshTimer) {
+      clearTimeout(this.recordingRefreshTimer);
+      this.recordingRefreshTimer = null;
+    }
     this.exitingInsertMode = false;
     this.pendingKeysAfterExit = "";
     if (this.exitInsertTimer) {
       clearTimeout(this.exitInsertTimer);
       this.exitInsertTimer = null;
     }
-    this.cancelDeferredCmdlineTextCommit();
     this.applyingFromNvim = false;
     this.clearBufferStates();
     if (this.cursorSyncTimer) {
@@ -1295,6 +1294,11 @@ export class MonacoNeovimClient {
     if (method === "monaco_mode") {
       const m = typeof params?.[0] === "string" ? String(params[0]) : "";
       this.applyNvimMode(m);
+      return;
+    }
+    if (method === "monaco_recording") {
+      const reg = typeof params?.[0] === "string" ? String(params[0]) : "";
+      this.recordingRegister = reg;
       return;
     }
     if (method === "nvim_buf_lines_event") {
@@ -1992,6 +1996,26 @@ export class MonacoNeovimClient {
     const onKeydownCapture = (e: KeyboardEvent) => {
       if (this.compositionActive || e.isComposing) return;
       if (e.getModifierState?.("AltGraph")) return;
+
+      if (
+        isCmdlineLike(this.lastMode)
+        && !this.delegateInsertToMonaco
+        && !this.exitingInsertMode
+        && !e.ctrlKey
+        && !e.metaKey
+        && (typeof e.key === "string" && e.key.length === 1)
+      ) {
+        const asciiPrintable = /^[\x20-\x7E]$/.test(e.key);
+        const treatAsAltChord = Boolean(e.altKey && asciiPrintable);
+        if (!treatAsAltChord) {
+          if (!this.opts.shouldHandleKey(e)) return;
+          // Prevent Monaco keybindings from swallowing plain printable characters
+          // in cmdline/search modes; rely on `input`/IME events for text.
+          stopAll(e);
+          return;
+        }
+      }
+
       if (!e.ctrlKey && !e.altKey && !e.metaKey) return;
       const name = this.modifiedKeyName(e);
       if (!name) return;
@@ -2036,7 +2060,6 @@ export class MonacoNeovimClient {
       this.compositionActive = false;
       this.setPreedit(null);
       this.debugLog(`compositionend delegateInsert=${this.delegateInsertToMonaco} mode=${JSON.stringify(this.lastMode)} data=${JSON.stringify((e as any).data ?? "")}`);
-      this.cancelDeferredCmdlineTextCommit();
       if (this.delegateInsertToMonaco) {
         this.scheduleCursorSyncToNvim();
         return;
@@ -2079,7 +2102,6 @@ export class MonacoNeovimClient {
       stopAll(e);
       const ie = e as InputEvent;
 
-      this.cancelDeferredCmdlineTextCommit();
       if (this.ignoreNextInputEvent) {
         this.ignoreNextInputEvent = false;
         try { if (target) target.value = ""; } catch (_) {}
@@ -2366,8 +2388,9 @@ export class MonacoNeovimClient {
     const m = typeof mode === "string" ? mode : "";
     if (!m || m === this.lastMode) return;
     this.lastMode = m;
+    if (isCmdlineLike(m)) this.ignoreNextInputEvent = false;
 
-    const nextDelegate = isInsertLike(m);
+    const nextDelegate = isInsertLike(m) && !this.recordingRegister;
     if (nextDelegate !== this.delegateInsertToMonaco) {
       this.delegateInsertToMonaco = nextDelegate;
       const state = this.ensureActiveState();
@@ -2467,7 +2490,7 @@ vim.opt.ei = ei
 
   private handleKey(ev: monaco.IKeyboardEvent): void {
     const browserEvent = ev.browserEvent as KeyboardEvent;
-    if (browserEvent.defaultPrevented && browserEvent.key !== "Escape") return;
+    if (browserEvent.defaultPrevented && browserEvent.key !== "Escape" && browserEvent.key !== "Enter") return;
     if (this.exitingInsertMode) {
       if (browserEvent.key === "Escape") {
         ev.preventDefault();
@@ -2528,7 +2551,6 @@ vim.opt.ei = ei
       const treatAsAltChord = Boolean(browserEvent.altKey && asciiPrintable);
       if (!treatAsAltChord) {
         if (!this.opts.shouldHandleKey(browserEvent)) return;
-        this.deferCmdlineTextCommit(browserEvent.key);
         return;
       }
     }
@@ -2558,6 +2580,20 @@ vim.opt.ei = ei
     // keydown. Ignore the next `input` to avoid double-sending text.
     this.ignoreNextInputEvent = true;
     ev.preventDefault();
+    if (this.lastMode.startsWith("n")) {
+      if (key === "q") {
+        if (this.recordingRegister) {
+          this.recordingRegister = "";
+          this.scheduleRecordingRefresh();
+        } else {
+          this.recordingRefreshArmed = true;
+        }
+      } else if (this.recordingRefreshArmed && typeof key === "string" && key.length === 1) {
+        this.recordingRefreshArmed = false;
+        this.recordingRegister = key;
+        this.scheduleRecordingRefresh();
+      }
+    }
     this.sendInput(key);
   }
 
@@ -2876,6 +2912,11 @@ local function send_scrolloff()
   vim.rpcnotify(chan, "monaco_scrolloff", so)
 end
 
+local function send_recording()
+  local r = vim.fn.reg_recording() or ""
+  vim.rpcnotify(chan, "monaco_recording", r)
+end
+
 if ${wrapped} then
   pcall(vim.cmd, "silent! source $HOME/.config/nvim/monaco-neovim-wasm/motion.vim")
 end
@@ -2899,6 +2940,10 @@ api.nvim_create_autocmd({ "ModeChanged", "InsertEnter", "InsertLeave" }, {
 api.nvim_create_autocmd({ "VisualEnter", "VisualLeave" }, {
   group = group,
   callback = function() send_mode(); send_cursor() end,
+})
+api.nvim_create_autocmd({ "RecordingEnter", "RecordingLeave" }, {
+  group = group,
+  callback = function() send_recording() end,
 })
 if ${scrolloff} then
   api.nvim_create_autocmd({ "OptionSet" }, {
@@ -2928,6 +2973,7 @@ api.nvim_create_autocmd({ "BufDelete" }, {
 send_mode()
 send_cursor()
 send_scrolloff()
+send_recording()
 vim.rpcnotify(chan, "monaco_buf_enter", {
   buf = api.nvim_get_current_buf(),
   name = api.nvim_buf_get_name(api.nvim_get_current_buf()) or "",

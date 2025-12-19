@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>e2e</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body { margin: 0; font-family: sans-serif; }
+      #bar { display: flex; gap: 12px; align-items: center; padding: 8px 12px; }
+      #status { font-size: 14px; }
+      #mode { font-family: ui-monospace, monospace; font-size: 13px; }
+      #editor { height: calc(100vh - 40px); }
+    </style>
+  </head>
+  <body>
+    <div id="bar">
+      <span id="status">idle</span>
+      <span id="mode">mode: -</span>
+    </div>
+    <div id="editor"></div>
+    <script type="module" src="/main.ts"></script>
+  </body>
+</html>
+

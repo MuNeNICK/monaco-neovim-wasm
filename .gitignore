@@ -7,6 +7,11 @@ npm-debug.log
 pnpm-debug.log
 *.tgz
 
+# Playwright
+playwright-report/
+test-results/
+blob-report/
+
 # Generated WASM assets
 public/nvim.wasm
 public/nvim-runtime.tar.gz
