@@ -25,7 +25,10 @@ export default defineConfig({
   webServer: process.env.E2E_BASE_URL
     ? undefined
     : {
-      command: `vite --config e2e/app/vite.config.ts --host 127.0.0.1 --port ${port} --strictPort`,
+      // CI: build once + preview for deterministic startup (avoids on-demand dev bundling delays).
+      command: process.env.CI
+        ? `sh -c "vite build --config e2e/app/vite.config.ts && vite preview --config e2e/app/vite.config.ts --host 127.0.0.1 --port ${port} --strictPort"`
+        : `vite --config e2e/app/vite.config.ts --host 127.0.0.1 --port ${port} --strictPort`,
       url: baseURL,
       reuseExistingServer: !process.env.CI,
     },

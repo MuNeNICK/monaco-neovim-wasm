@@ -427,7 +427,6 @@ export class MonacoNeovimClient {
   private compositionActive = false;
   private pendingResyncAfterComposition = false;
   private ignoreNextInputEvent = false;
-  private ignoreNvimBufLinesUntil = 0;
   private exitingInsertMode = false;
   private pendingKeysAfterExit = "";
   private exitInsertTimer: number | null = null;
@@ -486,7 +485,6 @@ export class MonacoNeovimClient {
     this.lastImeCommitText = payload;
     this.lastImeCommitAt = now;
     this.sendInput(normalizeNvimInputText(payload, true));
-    this.ignoreTextKeydownUntil = now + 60;
   }
 
   constructor(editor: MonacoEditor.IStandaloneCodeEditor, options: MonacoNeovimOptions = {}) {
@@ -1328,8 +1326,7 @@ export class MonacoNeovimClient {
             let isNoop = false;
             try { isNoop = model!.getValueInRange(patch.range) === patch.text; } catch (_) {}
             if (!isNoop) {
-              const now = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
-              if (state.pendingFullSync || state.pendingBufEdits.length || now < this.ignoreNvimBufLinesUntil) return;
+              if (state.pendingFullSync || state.pendingBufEdits.length) return;
               this.applyLinePatchToModel(model!, fl, ll, newLines!);
               try { state.shadowLines = model!.getLinesContent(); } catch (_) {}
             }
@@ -1991,13 +1988,22 @@ export class MonacoNeovimClient {
       try { e.stopPropagation(); } catch (_) {}
     };
 
-    const asInputArea = (target: EventTarget | null): HTMLTextAreaElement | null => {
+    const asInputTarget = (target: EventTarget | null): HTMLElement | null => {
       try {
-        const el = target as HTMLTextAreaElement | null;
+        const el = target as HTMLElement | null;
         if (!el || typeof (el as any).tagName !== "string") return null;
-        if ((el as any).tagName !== "TEXTAREA") return null;
-        if (!el.classList?.contains?.("inputarea")) return null;
-        return el;
+        const tag = (el as any).tagName;
+        if (tag === "TEXTAREA") {
+          // Monaco <0.5x: textarea.inputarea ; Monaco >=0.55: textarea.ime-text-area.
+          if (el.classList?.contains?.("inputarea") || el.classList?.contains?.("ime-text-area")) return el;
+          return null;
+        }
+        if (tag === "DIV") {
+          // Monaco >=0.55: native edit context div receives beforeinput/input.
+          if (el.classList?.contains?.("native-edit-context")) return el;
+          return null;
+        }
+        return null;
       } catch (_) {
         return null;
       }
@@ -2092,17 +2098,19 @@ export class MonacoNeovimClient {
         this.scheduleCursorSyncToNvim();
         return;
       }
-      const target = e.target as HTMLTextAreaElement | null;
+      const target = asInputTarget(e.target);
       if (isCmdlineLike(this.lastMode)) {
         // Command-line/search mode relies on IME/text input events, not keydown.
         const data = typeof e.data === "string" ? e.data : "";
-        const fallback = (!data && target?.value) ? String(target.value) : "";
+        const fallback = (!data && target && (target as any).tagName === "TEXTAREA" && (target as HTMLTextAreaElement).value)
+          ? String((target as HTMLTextAreaElement).value)
+          : (!data && target?.textContent ? String(target.textContent) : "");
         const commit = data || fallback;
         if (commit) this.sendCmdlineImeText(commit);
       }
       try {
-        const input = asInputArea(target);
-        if (input) input.value = "";
+        if (target && (target as any).tagName === "TEXTAREA") (target as HTMLTextAreaElement).value = "";
+        else if (target) target.textContent = "";
       } catch (_) {}
       if (this.pendingResyncAfterComposition) {
         this.pendingResyncAfterComposition = false;
@@ -2112,19 +2120,37 @@ export class MonacoNeovimClient {
     const onCompositionUpdate = (e: CompositionEvent) => {
       if (!this.compositionActive) this.compositionActive = true;
       if (this.delegateInsertToMonaco) return;
-      const target = asInputArea(e.target);
-      const data = typeof e.data === "string" ? e.data : (target?.value ? String(target.value) : "");
+      const target = asInputTarget(e.target);
+      const data = typeof e.data === "string" ? e.data : (
+        (target && (target as any).tagName === "TEXTAREA" && (target as HTMLTextAreaElement).value)
+          ? String((target as HTMLTextAreaElement).value)
+          : (target?.textContent ? String(target.textContent) : "")
+      );
       this.setPreedit(data || "");
     };
     const onBeforeInput = (e: Event) => {
-      if (!asInputArea(e.target)) return;
+      const target = asInputTarget(e.target);
+      if (!target) return;
       if (this.delegateInsertToMonaco && !this.exitingInsertMode) return;
       // Prevent Monaco from turning IME/text input events into model edits; Neovim
       // remains the source of truth and we re-render from nvim_buf_lines_event.
       stopAll(e);
+      try { (e as InputEvent).preventDefault?.(); } catch (_) {}
+
+      // Monaco >=0.55 can deliver cmdline typing via `beforeinput` (native edit context)
+      // instead of `input` (textarea). Handle text commits here so cmdline/search works.
+      if (isCmdlineLike(this.lastMode) && !this.compositionActive) {
+        const ie = e as InputEvent;
+        const data = typeof ie.data === "string" ? ie.data : "";
+        const inputType = typeof (ie as any).inputType === "string" ? String((ie as any).inputType) : "";
+        const composing = Boolean((ie as any).isComposing);
+        if (!composing && !inputType.includes("Composition") && data) {
+          this.sendCmdlineImeText(data);
+        }
+      }
     };
     const onInput = (e: Event) => {
-      const target = asInputArea((e as InputEvent).target);
+      const target = asInputTarget((e as InputEvent).target);
       if (!target) return;
       if (this.delegateInsertToMonaco && !this.exitingInsertMode) return;
       stopAll(e);
@@ -2132,21 +2158,30 @@ export class MonacoNeovimClient {
 
       if (this.ignoreNextInputEvent) {
         this.ignoreNextInputEvent = false;
-        try { if (target) target.value = ""; } catch (_) {}
+        try {
+          if ((target as any).tagName === "TEXTAREA") (target as HTMLTextAreaElement).value = "";
+          else target.textContent = "";
+        } catch (_) {}
         return;
       }
       if (this.compositionActive) return;
 
       if (isCmdlineLike(this.lastMode)) {
         const data = typeof ie.data === "string" ? ie.data : "";
-        const fallback = (!data && target?.value) ? String(target.value) : "";
+        const fallback = (!data && (target as any).tagName === "TEXTAREA" && (target as HTMLTextAreaElement).value)
+          ? String((target as HTMLTextAreaElement).value)
+          : (!data && target?.textContent ? String(target.textContent) : "");
         const commit = data || fallback;
         if (commit) this.sendCmdlineImeText(commit);
       }
-      try { if (target) target.value = ""; } catch (_) {}
+      try {
+        if ((target as any).tagName === "TEXTAREA") (target as HTMLTextAreaElement).value = "";
+        else target.textContent = "";
+      } catch (_) {}
     };
     const onPaste = (e: ClipboardEvent) => {
-      if (!asInputArea(e.target)) return;
+      const target = asInputTarget(e.target);
+      if (!target) return;
       if (this.delegateInsertToMonaco && !this.exitingInsertMode) return;
       stopAll(e);
       const text = e.clipboardData?.getData("text/plain") ?? "";
@@ -2155,7 +2190,10 @@ export class MonacoNeovimClient {
         this.ignoreNextInputEvent = true;
         this.pasteText(text);
       }
-      try { (e.target as HTMLTextAreaElement | null)?.value && ((e.target as HTMLTextAreaElement).value = ""); } catch (_) {}
+      try {
+        if ((target as any).tagName === "TEXTAREA") (target as HTMLTextAreaElement).value = "";
+        else target.textContent = "";
+      } catch (_) {}
     };
 
     this.disposables.push(
@@ -2537,7 +2575,6 @@ vim.opt.ei = ei
 
   private handleKey(ev: monaco.IKeyboardEvent): void {
     const browserEvent = ev.browserEvent as KeyboardEvent;
-    if (browserEvent.defaultPrevented && browserEvent.key !== "Escape" && browserEvent.key !== "Enter") return;
     if (this.exitingInsertMode) {
       if (browserEvent.key === "Escape") {
         ev.preventDefault();
@@ -2863,8 +2900,6 @@ api.nvim_win_set_cursor(0, { b_line, b_col0 })
     applyShadowLinesChange(state.shadowLines, startRow, startColChar, endRow, endColChar, text);
 
     state.pendingCursorSync = true;
-    const now = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
-    this.ignoreNvimBufLinesUntil = now + Math.max(80, (this.opts.insertSyncDebounceMs || 20) * 4);
     this.scheduleFlushPendingMonacoSync();
   }
 

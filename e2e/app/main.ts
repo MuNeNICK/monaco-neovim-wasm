@@ -27,12 +27,16 @@ const editor = monaco.editor.create(editorHost, {
   minimap: { enabled: false },
   automaticLayout: true,
 });
+editor.focus();
 
 const client = createMonacoNeovim(editor, {
   worker: new Worker(new URL("../../packages/lib/src/nvimWorkerAsyncify.ts", import.meta.url), { type: "module" }),
   inputMode: "message",
   wasmPath: "/nvim-asyncify.wasm",
   runtimePath: "/nvim-runtime.tar.gz",
+  // GitHub Actions can be significantly slower at fetching/untar/gunzip + initial RPC.
+  // Keep E2E robust by allowing more time before declaring RPC timeouts.
+  rpcTimeoutMs: 30_000,
   status: (text: string, warn?: boolean) => {
     statusEl.textContent = warn ? `WARN: ${text}` : text;
   },
@@ -47,6 +51,7 @@ async function start() {
   try {
     await client.start([]);
     statusEl.textContent = "ready";
+    editor.focus();
   } catch (err) {
     statusEl.textContent = `start failed: ${(err as Error)?.message ?? err}`;
   }

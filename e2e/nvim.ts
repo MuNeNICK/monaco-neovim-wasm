@@ -7,6 +7,7 @@ declare global {
       command: (cmd: string) => void;
     };
     monacoEditor?: {
+      focus?: () => void;
       getModel: () => { getValue: () => string } | null;
       getPosition: () => { lineNumber: number; column: number } | null;
     };
@@ -15,10 +16,9 @@ declare global {
 
 export async function waitForAppReady(page: Page) {
   await page.goto("/");
-  await expect(page.locator("#status")).toHaveText("ready");
+  await expect(page.locator("#status")).toHaveText("ready", { timeout: process.env.CI ? 90_000 : 20_000 });
   await page.evaluate(() => {
-    const el = document.querySelector<HTMLTextAreaElement>(".monaco-editor textarea");
-    el?.focus();
+    window.monacoEditor?.focus?.();
   });
 }
 
@@ -32,7 +32,9 @@ export async function execLua<T = unknown>(page: Page, code: string, args: unkno
 export async function getMonacoValue(page: Page): Promise<string> {
   return await page.evaluate(() => {
     if (!window.monacoEditor) throw new Error("window.monacoEditor missing");
-    return window.monacoEditor.getModel()?.getValue() ?? "";
+    const raw = window.monacoEditor.getModel()?.getValue() ?? "";
+    // Normalize line endings so E2E stays stable across Monaco EOL settings / environments.
+    return raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   });
 }
 

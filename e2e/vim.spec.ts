@@ -133,12 +133,13 @@ test.describe("Monaco Neovim WASM - Vim E2E", () => {
     await waitForMode(page, "n");
     await expect.poll(async () => await execLua(page, `return vim.fn.expand("<cword>")`)).toBe("foo");
 
+    const colAfterEnter = (await getCursor(page)).col;
     await page.keyboard.press("n");
-    await expect.poll(async () => (await getCursor(page)).col).toBeGreaterThan(5);
+    await expect.poll(async () => (await getCursor(page)).col).not.toBe(colAfterEnter);
     await expect.poll(async () => await execLua(page, `return vim.fn.expand("<cword>")`)).toBe("foo");
 
     await page.keyboard.press("N");
-    await expect.poll(async () => (await getCursor(page)).col).toBeLessThan(5);
+    await expect.poll(async () => (await getCursor(page)).col).toBe(colAfterEnter);
     await expect.poll(async () => await execLua(page, `return vim.fn.expand("<cword>")`)).toBe("foo");
   });
 
@@ -191,6 +192,32 @@ test.describe("Monaco Neovim WASM - Vim E2E", () => {
       return true
     `);
     await waitForNvimBuffer(page, ["> one", "> two", "three"]);
+  });
+
+  test("macro: playback via keyboard @a after delegated insert", async ({ page }) => {
+    await setBuffer(page, ["one", "two"]);
+
+    await page.keyboard.press("q");
+    await page.keyboard.press("a");
+    await page.keyboard.press("Shift+I");
+    await waitForMode(page, "i");
+    await page.keyboard.type("> ", { delay: keyDelayMs });
+    await page.keyboard.press("Escape");
+    await waitForMode(page, "n");
+    await page.keyboard.press("j");
+    await page.keyboard.press("q");
+    await waitForMode(page, "n");
+
+    // Trigger insert delegation (Monaco-owned typing), then immediately run a macro.
+    await page.keyboard.press("0");
+    await page.keyboard.press("i");
+    await waitForMode(page, "i");
+    await page.keyboard.type("x", { delay: keyDelayMs });
+    await page.keyboard.press("Escape");
+    await waitForMode(page, "n");
+
+    await page.keyboard.type("@a", { delay: keyDelayMs });
+    await waitForNvimBuffer(page, ["> one", "> xtwo"]);
   });
 
   test("marks: ma then jump with `a", async ({ page }) => {

@@ -97,6 +97,7 @@ export class NeovimWasmSession {
   private readonly pending = new Map<number, PendingEntry>();
   private workerExited = false;
   private workerExitCode: number | null = null;
+  private workerFatalError: string | null = null;
   private inputQueue: Uint8Array[] = [];
   private inputQueueHead = 0;
   private inputQueuedBytes = 0;
@@ -141,6 +142,7 @@ export class NeovimWasmSession {
     this.sharedInput = this.inputMode === "shared" ? createSharedInputRing(this.init.sharedInputBytes) : null;
     this.workerExited = false;
     this.workerExitCode = null;
+    this.workerFatalError = null;
     this.reqId = 1;
     this.pending.clear();
 
@@ -156,6 +158,26 @@ export class NeovimWasmSession {
     if (!this.worker) throw new Error("worker/workerUrl is required");
 
     this.worker.onmessage = (event: MessageEvent<WorkerMessages>) => this.handleWorkerMessage(event.data);
+    const failWorker = (message: string) => {
+      if (this.workerExited) return;
+      this.workerFatalError = message;
+      this.workerExited = true;
+      this.workerExitCode = 1;
+      if (this.pending.size) {
+        const err = new Error(message);
+        this.pending.forEach((entry) => entry.reject(err));
+        this.pending.clear();
+      }
+      try { this.init.handlers.onStartError?.(message); } catch (_) {}
+    };
+    this.worker.onerror = (ev: ErrorEvent) => {
+      const msg = ev?.message ? `worker error: ${ev.message}` : "worker error";
+      const stack = (ev as any)?.error?.stack;
+      failWorker(stack ? `${msg}\n${stack}` : msg);
+    };
+    this.worker.onmessageerror = () => {
+      failWorker("worker messageerror");
+    };
     const startMsg: Record<string, unknown> = {
       type: "start",
       cols: Number(cols) || 80,
@@ -221,7 +243,8 @@ export class NeovimWasmSession {
       if (!this.worker) { reject(new Error("session not started")); return; }
       if (this.workerExited) {
         const code = this.workerExitCode;
-        reject(new Error(code != null ? `nvim exited (${code})` : "nvim exited"));
+        const suffix = this.workerFatalError ? `: ${this.workerFatalError}` : "";
+        reject(new Error(code != null ? `nvim exited (${code})${suffix}` : `nvim exited${suffix}`));
         return;
       }
       const id = this.reqId++;
@@ -232,7 +255,9 @@ export class NeovimWasmSession {
         if (!this.pending.has(id)) return;
         this.pending.delete(id);
         reject(new Error(this.workerExited
-          ? (this.workerExitCode != null ? `nvim exited (${this.workerExitCode})` : "nvim exited")
+          ? (this.workerExitCode != null
+            ? `nvim exited (${this.workerExitCode})${this.workerFatalError ? `: ${this.workerFatalError}` : ""}`
+            : `nvim exited${this.workerFatalError ? `: ${this.workerFatalError}` : ""}`)
           : `rpc timeout: ${method}`));
       }, this.init.rpcTimeoutMs);
     });
@@ -240,13 +265,23 @@ export class NeovimWasmSession {
 
   async waitForApi(): Promise<void> {
     const delay = 300;
-    const maxMs = Math.min(Math.max(this.init.rpcTimeoutMs * 2, 10_000), 15_000);
-    const retries = Math.ceil(maxMs / delay);
-    for (let i = 0; i < retries; i += 1) {
+    const maxMs = Math.min(Math.max(this.init.rpcTimeoutMs * 2, 15_000), 90_000);
+    const deadline = Date.now() + maxMs;
+    while (Date.now() < deadline) {
+      if (this.workerExited) {
+        const code = this.workerExitCode;
+        const suffix = this.workerFatalError ? `: ${this.workerFatalError}` : "";
+        throw new Error(code != null ? `nvim exited (${code})${suffix}` : `nvim exited${suffix}`);
+      }
       try {
         await this.call("nvim_get_api_info", []);
         return;
       } catch (_) {
+        if (this.workerExited) {
+          const code = this.workerExitCode;
+          const suffix = this.workerFatalError ? `: ${this.workerFatalError}` : "";
+          throw new Error(code != null ? `nvim exited (${code})${suffix}` : `nvim exited${suffix}`);
+        }
         await new Promise((r) => setTimeout(r, delay));
       }
     }
