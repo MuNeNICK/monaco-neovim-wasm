@@ -6,6 +6,10 @@ declare global {
       execLua: <T = unknown>(code: string, args?: unknown[]) => Promise<T>;
       command: (cmd: string) => void;
     };
+    monacoEditor?: {
+      getModel: () => { getValue: () => string } | null;
+      getPosition: () => { lineNumber: number; column: number } | null;
+    };
   }
 }
 
@@ -25,6 +29,39 @@ export async function execLua<T = unknown>(page: Page, code: string, args: unkno
   }, { code, args }) as T;
 }
 
+export async function getMonacoValue(page: Page): Promise<string> {
+  return await page.evaluate(() => {
+    if (!window.monacoEditor) throw new Error("window.monacoEditor missing");
+    return window.monacoEditor.getModel()?.getValue() ?? "";
+  });
+}
+
+export async function waitForMonacoValue(page: Page, expected: string) {
+  await expect.poll(async () => await getMonacoValue(page)).toBe(expected);
+}
+
+export async function getMonacoPosition(page: Page): Promise<{ row: number; col: number }> {
+  return await page.evaluate(() => {
+    if (!window.monacoEditor) throw new Error("window.monacoEditor missing");
+    const pos = window.monacoEditor.getPosition();
+    if (!pos) return { row: 1, col: 1 };
+    return { row: pos.lineNumber, col: pos.column };
+  });
+}
+
+export async function waitForMonacoCursor(page: Page, expected: { row: number; col: number }) {
+  await expect.poll(async () => await getMonacoPosition(page)).toEqual(expected);
+}
+
+export async function feedKeys(page: Page, keys: string, mode = "n") {
+  await execLua(page, `
+    local tc = vim.api.nvim_replace_termcodes
+    local keys, mode = ...
+    vim.api.nvim_feedkeys(tc(keys, true, false, true), mode, false)
+    return true
+  `, [String(keys ?? ""), String(mode ?? "n")]);
+}
+
 export async function setBuffer(page: Page, lines: string[]) {
   await execLua(page, `
     local tc = vim.api.nvim_replace_termcodes
@@ -35,6 +72,7 @@ export async function setBuffer(page: Page, lines: string[]) {
   `, [lines]);
   await waitForNvimBuffer(page, lines);
   await waitForCursor(page, { row: 1, col: 0 });
+  await waitForMonacoCursor(page, { row: 1, col: 1 });
   await waitForMode(page, "n");
 }
 
@@ -57,7 +95,13 @@ export async function waitForMode(page: Page, mode: string) {
 }
 
 export async function waitForNvimBuffer(page: Page, expectedLines: string[]) {
-  await expect.poll(async () => await getBufferLines(page)).toEqual(expectedLines);
+  const expectedValue = expectedLines.join("\n");
+  await expect
+    .poll(async () => {
+      const [nvimLines, monacoValue] = await Promise.all([getBufferLines(page), getMonacoValue(page)]);
+      return { nvimLines, monacoValue };
+    })
+    .toEqual({ nvimLines: expectedLines, monacoValue: expectedValue });
 }
 
 export async function waitForCursor(page: Page, expected: { row: number; col: number }) {

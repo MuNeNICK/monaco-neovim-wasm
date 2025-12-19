@@ -40,6 +40,7 @@ const client = createMonacoNeovim(editor, {
 });
 
 (window as any).nvimClient = client;
+(window as any).monacoEditor = editor;
 
 async function start() {
   statusEl.textContent = "starting...";
@@ -52,4 +53,3 @@ async function start() {
 }
 
 void start();
-

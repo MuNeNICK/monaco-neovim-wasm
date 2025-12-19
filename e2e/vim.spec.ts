@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { command, execLua, getBufferLines, getCursor, setBuffer, waitForAppReady, waitForCursor, waitForMode, waitForNvimBuffer } from "./nvim";
+import { command, execLua, getBufferLines, getCursor, setBuffer, waitForAppReady, waitForCursor, waitForMode, waitForMonacoCursor, waitForNvimBuffer } from "./nvim";
 
 const keyDelayMs = 20;
 
@@ -142,6 +142,22 @@ test.describe("Monaco Neovim WASM - Vim E2E", () => {
     await waitForNvimBuffer(page, ["hello"]);
   });
 
+  test("redo (<C-r>) after undo", async ({ page }) => {
+    await setBuffer(page, ["hello"]);
+    await page.keyboard.press("A");
+    await waitForMode(page, "i");
+    await page.keyboard.type(" world", { delay: keyDelayMs });
+    await page.keyboard.press("Escape");
+    await waitForMode(page, "n");
+    await waitForNvimBuffer(page, ["hello world"]);
+
+    await page.keyboard.press("u");
+    await waitForNvimBuffer(page, ["hello"]);
+
+    await page.keyboard.press("Control+R");
+    await waitForNvimBuffer(page, ["hello world"]);
+  });
+
   test("macro: qa...q then @a", async ({ page }) => {
     await setBuffer(page, ["one", "two", "three"]);
     await page.keyboard.press("q");
@@ -227,5 +243,134 @@ test.describe("Monaco Neovim WASM - Vim E2E", () => {
     await page.keyboard.press("Escape");
     const status = await page.locator("#status").textContent();
     expect(status).not.toMatch(/WARN/i);
+  });
+
+  test("repeat: . (dot) after operator", async ({ page }) => {
+    await setBuffer(page, ["one two three"]);
+    await page.keyboard.type("dw", { delay: keyDelayMs });
+    await waitForNvimBuffer(page, ["two three"]);
+    await page.keyboard.press(".");
+    await waitForNvimBuffer(page, ["three"]);
+  });
+
+  test("repeat: . (dot) after insert (including backspace)", async ({ page }) => {
+    test.fail(true, "TODO: Monaco委譲のinsert入力ではNeovimの.が挿入文字列を記録できていない");
+    await setBuffer(page, ["aaa bbb", "aaa bbb"]);
+
+    await page.keyboard.type("cw", { delay: keyDelayMs });
+    await waitForMode(page, "i");
+    await page.keyboard.type("helloo", { delay: keyDelayMs });
+    await page.keyboard.press("Backspace");
+    await page.keyboard.press("Escape");
+    await waitForMode(page, "n");
+    await waitForNvimBuffer(page, ["hello bbb", "aaa bbb"]);
+
+    await page.keyboard.press("j");
+    await page.keyboard.press("0");
+    await page.keyboard.press(".");
+    await waitForNvimBuffer(page, ["hello bbb", "hello bbb"]);
+  });
+
+  test("utf-8 cursor sync: nvim byte col <-> monaco char col", async ({ page }) => {
+    await setBuffer(page, ["aあb"]);
+    await waitForCursor(page, { row: 1, col: 0 });
+    await waitForMonacoCursor(page, { row: 1, col: 1 });
+
+    await page.keyboard.press("l");
+    await waitForCursor(page, { row: 1, col: 1 });
+    await waitForMonacoCursor(page, { row: 1, col: 2 });
+
+    await page.keyboard.press("l");
+    await waitForCursor(page, { row: 1, col: 4 });
+    await waitForMonacoCursor(page, { row: 1, col: 3 });
+
+    await page.keyboard.press("i");
+    await waitForMode(page, "i");
+    await page.keyboard.type("う", { delay: keyDelayMs });
+    await page.keyboard.press("Escape");
+    await waitForMode(page, "n");
+    await waitForNvimBuffer(page, ["aあうb"]);
+    await waitForCursor(page, { row: 1, col: 7 });
+    await waitForMonacoCursor(page, { row: 1, col: 4 });
+  });
+
+  test("find-char motions: f/t + ;/,", async ({ page }) => {
+    await setBuffer(page, ["a_b_c_d"]);
+    await page.keyboard.type("f_", { delay: keyDelayMs });
+    await waitForCursor(page, { row: 1, col: 1 });
+    await page.keyboard.press(";");
+    await waitForCursor(page, { row: 1, col: 3 });
+    await page.keyboard.press(",");
+    await waitForCursor(page, { row: 1, col: 1 });
+
+    await page.keyboard.press("0");
+    await page.keyboard.type("t_", { delay: keyDelayMs });
+    await waitForCursor(page, { row: 1, col: 0 });
+  });
+
+  test("text objects: ci\" and di(", async ({ page }) => {
+    await setBuffer(page, ["print(\"hello world\")", "func(foo, bar)"]);
+
+    await page.keyboard.type("f\"", { delay: keyDelayMs });
+    await page.keyboard.press("ArrowRight");
+    await page.keyboard.type("ci\"", { delay: keyDelayMs });
+    await waitForMode(page, "i");
+    await page.keyboard.type("bye", { delay: keyDelayMs });
+    await page.keyboard.press("Escape");
+    await waitForMode(page, "n");
+    await waitForNvimBuffer(page, ["print(\"bye\")", "func(foo, bar)"]);
+
+    await page.keyboard.press("j");
+    await page.keyboard.type("f(", { delay: keyDelayMs });
+    await page.keyboard.press("ArrowRight");
+    await page.keyboard.type("di(", { delay: keyDelayMs });
+    await waitForNvimBuffer(page, ["print(\"bye\")", "func()"]);
+  });
+
+  test("join lines (J) and indent/unindent (>>/<<)", async ({ page }) => {
+    await execLua(page, `
+      vim.o.expandtab = true
+      vim.o.shiftwidth = 2
+      vim.o.tabstop = 2
+      return true
+    `);
+    await setBuffer(page, ["one", "two", "three"]);
+
+    await page.keyboard.type("3J", { delay: keyDelayMs });
+    await waitForNvimBuffer(page, ["one two three"]);
+
+    await page.keyboard.type(">>", { delay: keyDelayMs });
+    await waitForNvimBuffer(page, ["  one two three"]);
+    await page.keyboard.type("<<", { delay: keyDelayMs });
+    await waitForNvimBuffer(page, ["one two three"]);
+  });
+
+  test("registers: linewise P and named register \"a", async ({ page }) => {
+    await setBuffer(page, ["one", "two"]);
+    await page.keyboard.type("yy", { delay: keyDelayMs });
+    await page.keyboard.press("j");
+    await page.keyboard.press("P");
+    await waitForNvimBuffer(page, ["one", "one", "two"]);
+
+    await setBuffer(page, ["one", "two"]);
+    await page.keyboard.type("\"ayy", { delay: keyDelayMs });
+    await page.keyboard.press("j");
+    await page.keyboard.type("\"ap", { delay: keyDelayMs });
+    await waitForNvimBuffer(page, ["one", "two", "one"]);
+  });
+
+  test("visual block: <C-v> via keyboard (no paste)", async ({ page }) => {
+    await setBuffer(page, ["a", "b", "c"]);
+    await page.keyboard.press("Control+V");
+    await waitForMode(page, "\u0016");
+    await page.keyboard.press("j");
+    await page.keyboard.press("j");
+    await page.keyboard.press("Shift+I");
+    await waitForMode(page, "i");
+    await page.keyboard.type("> ", { delay: keyDelayMs });
+    await page.keyboard.press("Escape");
+    await waitForNvimBuffer(page, ["> a", "> b", "> c"]);
+    await page.keyboard.press("Escape");
+    await waitForMode(page, "n");
   });
 });

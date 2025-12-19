@@ -427,6 +427,7 @@ export class MonacoNeovimClient {
   private compositionActive = false;
   private pendingResyncAfterComposition = false;
   private ignoreNextInputEvent = false;
+  private ignoreNvimBufLinesUntil = 0;
   private exitingInsertMode = false;
   private pendingKeysAfterExit = "";
   private exitInsertTimer: number | null = null;
@@ -1305,7 +1306,6 @@ export class MonacoNeovimClient {
       const [buf, _changedtick, firstline, lastline, linedata] = params;
       const id = extractBufId(buf);
       if (!id) return;
-      if (this.delegateInsertToMonaco && this.bufHandle != null && id === this.bufHandle) return;
       const state = (this.bufHandle != null && id === this.bufHandle) ? this.ensureActiveState() : (this.buffers.get(id) ?? null);
       if (!state) return;
       if (this.bufHandle != null && id === this.bufHandle && this.compositionActive) {
@@ -1322,7 +1322,18 @@ export class MonacoNeovimClient {
       const canPatch = model && Number.isInteger(fl) && Number.isInteger(ll) && fl >= 0 && ll >= fl && newLines;
       if (canPatch) {
         try {
-          if (this.bufHandle != null && id === this.bufHandle && this.editor.getModel() === model) {
+          const isActiveModel = this.bufHandle != null && id === this.bufHandle && this.editor.getModel() === model;
+          if (isActiveModel && this.delegateInsertToMonaco) {
+            const patch = this.computeLinePatch(model!, fl, ll, newLines!);
+            let isNoop = false;
+            try { isNoop = model!.getValueInRange(patch.range) === patch.text; } catch (_) {}
+            if (!isNoop) {
+              const now = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
+              if (state.pendingFullSync || state.pendingBufEdits.length || now < this.ignoreNvimBufLinesUntil) return;
+              this.applyLinePatchToModel(model!, fl, ll, newLines!);
+              try { state.shadowLines = model!.getLinesContent(); } catch (_) {}
+            }
+          } else if (isActiveModel) {
             this.applyLinePatch(model!, fl, ll, newLines!);
           } else {
             this.applyLinePatchToModel(model!, fl, ll, newLines!);
@@ -1360,15 +1371,22 @@ export class MonacoNeovimClient {
     }
   }
 
-  private applyLinePatch(model: monaco.editor.ITextModel, firstline: number, lastline: number, newLines: string[]): void {
+  private computeLinePatch(
+    model: monaco.editor.ITextModel,
+    firstline: number,
+    lastline: number,
+    newLines: string[],
+  ): { range: monaco.Range; text: string } {
     const oldLineCount = model.getLineCount();
     const fl = Math.min(firstline, oldLineCount);
     const ll = Math.min(lastline, oldLineCount);
-    const pos = this.lastCursorPos ?? this.editor.getPosition() ?? new monaco.Position(1, 1);
 
     const eof = new monaco.Position(oldLineCount, model.getLineMaxColumn(oldLineCount));
-    const start = fl < oldLineCount ? new monaco.Position(fl + 1, 1) : eof;
-    const end = ll < oldLineCount ? new monaco.Position(ll + 1, 1) : eof;
+    const deletingToEof = ll >= oldLineCount && newLines.length === 0;
+    const startPos = (deletingToEof && fl > 0)
+      ? new monaco.Position(fl, model.getLineMaxColumn(fl))
+      : (fl < oldLineCount ? new monaco.Position(fl + 1, 1) : eof);
+    const endPos = ll < oldLineCount ? new monaco.Position(ll + 1, 1) : eof;
 
     let text = newLines.join("\n");
     const insertingAtEof = firstline >= oldLineCount && lastline >= oldLineCount;
@@ -1376,16 +1394,22 @@ export class MonacoNeovimClient {
     const hasFollowingLine = lastline < oldLineCount;
     if (hasFollowingLine && newLines.length > 0) text += "\n";
 
-    const range = new monaco.Range(start.lineNumber, start.column, end.lineNumber, end.column);
+    const range = new monaco.Range(startPos.lineNumber, startPos.column, endPos.lineNumber, endPos.column);
+    return { range, text };
+  }
+
+  private applyLinePatch(model: monaco.editor.ITextModel, firstline: number, lastline: number, newLines: string[]): void {
+    const pos = this.lastCursorPos ?? this.editor.getPosition() ?? new monaco.Position(1, 1);
+    const patch = this.computeLinePatch(model, firstline, lastline, newLines);
     try {
-      const existing = model.getValueInRange(range);
-      if (existing === text) return;
+      const existing = model.getValueInRange(patch.range);
+      if (existing === patch.text) return;
     } catch (_) {
     }
 
     this.suppressCursorSync = true;
     this.applyingFromNvim = true;
-    model.applyEdits([{ range, text }]);
+    model.applyEdits([{ range: patch.range, text: patch.text }]);
     this.applyingFromNvim = false;
     if (pos) this.editor.setPosition(pos);
     this.suppressCursorSync = false;
@@ -1400,29 +1424,15 @@ export class MonacoNeovimClient {
   }
 
   private applyLinePatchToModel(model: monaco.editor.ITextModel, firstline: number, lastline: number, newLines: string[]): void {
-    const oldLineCount = model.getLineCount();
-    const fl = Math.min(firstline, oldLineCount);
-    const ll = Math.min(lastline, oldLineCount);
-
-    const eof = new monaco.Position(oldLineCount, model.getLineMaxColumn(oldLineCount));
-    const start = fl < oldLineCount ? new monaco.Position(fl + 1, 1) : eof;
-    const end = ll < oldLineCount ? new monaco.Position(ll + 1, 1) : eof;
-
-    let text = newLines.join("\n");
-    const insertingAtEof = firstline >= oldLineCount && lastline >= oldLineCount;
-    if (insertingAtEof && newLines.length > 0) text = `\n${text}`;
-    const hasFollowingLine = lastline < oldLineCount;
-    if (hasFollowingLine && newLines.length > 0) text += "\n";
-
-    const range = new monaco.Range(start.lineNumber, start.column, end.lineNumber, end.column);
+    const patch = this.computeLinePatch(model, firstline, lastline, newLines);
     try {
-      const existing = model.getValueInRange(range);
-      if (existing === text) return;
+      const existing = model.getValueInRange(patch.range);
+      if (existing === patch.text) return;
     } catch (_) {
     }
 
     this.applyingFromNvim = true;
-    try { model.applyEdits([{ range, text }]); } catch (_) {}
+    try { model.applyEdits([{ range: patch.range, text: patch.text }]); } catch (_) {}
     this.applyingFromNvim = false;
   }
 
@@ -2465,8 +2475,11 @@ export class MonacoNeovimClient {
 local api = vim.api
 local keys, bs = ...
 keys = type(keys) == "string" and keys or ""
-bs = tonumber(bs) or 0
 if keys == "" then
+  return
+end
+local mode = (api.nvim_get_mode() or {}).mode or ""
+if not mode:match("^[iR]") then
   return
 end
 local ei = vim.opt.ei:get()
@@ -2474,13 +2487,14 @@ vim.opt.ei = "all"
 local curr_win = api.nvim_get_current_win()
 local temp_buf = api.nvim_create_buf(false, true)
 local temp_win = api.nvim_open_win(temp_buf, true, { external = true, width = 1, height = 1 })
+bs = tonumber(bs) or 0
 if bs > 0 then
-  api.nvim_buf_set_lines(temp_buf, 0, -1, false, { ("x"):rep(bs) })
-  api.nvim_win_set_cursor(temp_win, { 1, bs })
+  pcall(api.nvim_buf_set_lines, temp_buf, 0, -1, false, { ("x"):rep(bs) })
+  pcall(api.nvim_win_set_cursor, temp_win, { 1, bs })
 end
 local tc = api.nvim_replace_termcodes(keys, true, true, true)
 api.nvim_feedkeys(tc, "n", true)
-api.nvim_set_current_win(curr_win)
+pcall(api.nvim_set_current_win, curr_win)
 pcall(api.nvim_win_close, temp_win, true)
 pcall(api.nvim_buf_delete, temp_buf, { force = true })
 vim.opt.ei = ei
@@ -2807,6 +2821,8 @@ api.nvim_win_set_cursor(0, { b_line, b_col0 })
     applyShadowLinesChange(state.shadowLines, startRow, startColChar, endRow, endColChar, text);
 
     state.pendingCursorSync = true;
+    const now = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
+    this.ignoreNvimBufLinesUntil = now + Math.max(80, (this.opts.insertSyncDebounceMs || 20) * 4);
     this.scheduleFlushPendingMonacoSync();
   }
 
