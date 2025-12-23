@@ -517,6 +517,14 @@ export class MonacoNeovimClient {
   private popupEl: HTMLDivElement | null = null;
   private popupItems: PopupMenuItem[] = [];
   private popupSelected = -1;
+  private pendingRedrawEvents: unknown[][] = [];
+  private stagingRedrawFrame = false;
+  private stagedCmdlineText: string | null | undefined = undefined;
+  private stagedCmdlineCursorByte: number | null | undefined = undefined;
+  private stagedMessageText: string | null | undefined = undefined;
+  private stagedPopupItems: PopupMenuItem[] | null | undefined = undefined;
+  private stagedPopupSelected: number | undefined = undefined;
+  private stagedSearchRefresh = false;
   private preeditEl: HTMLDivElement | null = null;
   private preeditVisible = false;
   private compositionActive = false;
@@ -833,6 +841,14 @@ export class MonacoNeovimClient {
     this.setCmdline(null);
     this.setMessage(null);
     this.setPopupmenu(null, -1);
+    this.pendingRedrawEvents = [];
+    this.stagingRedrawFrame = false;
+    this.stagedCmdlineText = undefined;
+    this.stagedCmdlineCursorByte = undefined;
+    this.stagedMessageText = undefined;
+    this.stagedPopupItems = undefined;
+    this.stagedPopupSelected = undefined;
+    this.stagedSearchRefresh = false;
     if (this.resyncTimer) {
       clearTimeout(this.resyncTimer);
       this.resyncTimer = null;
@@ -1017,7 +1033,7 @@ export class MonacoNeovimClient {
       this.editor.onDidScrollChange(() => {
         if (!this.opts.searchHighlights) return;
         if (this.compositionActive) return;
-        this.scheduleSearchHighlightRefresh();
+        this.requestSearchHighlightRefresh();
       }),
     );
     this.disposables.push(
@@ -1654,7 +1670,197 @@ export class MonacoNeovimClient {
         this.bufHandle = null;
       }
     } else if (method === "redraw") {
-      this.handleRedraw(params);
+      this.handleRedrawNotify(params);
+    }
+  }
+
+  private handleRedrawNotify(params: unknown[]): void {
+    if (!Array.isArray(params)) return;
+    for (const ev of params) {
+      if (Array.isArray(ev)) this.pendingRedrawEvents.push(ev as unknown[]);
+    }
+    if (!this.pendingRedrawEvents.length) return;
+
+    let flushIdx = -1;
+    for (let i = 0; i < this.pendingRedrawEvents.length; i += 1) {
+      const ev = this.pendingRedrawEvents[i];
+      const name = Array.isArray(ev) ? ev[0] : null;
+      if (name === "flush") flushIdx = i;
+    }
+    if (flushIdx < 0) return;
+
+    const toProcess = this.pendingRedrawEvents.slice(0, flushIdx + 1);
+    this.pendingRedrawEvents = this.pendingRedrawEvents.slice(flushIdx + 1);
+
+    let start = 0;
+    for (let i = 0; i < toProcess.length; i += 1) {
+      const ev = toProcess[i];
+      const name = Array.isArray(ev) ? ev[0] : null;
+      if (name === "flush") {
+        const frame = toProcess.slice(start, i + 1);
+        start = i + 1;
+        this.processRedrawFrame(frame);
+      }
+    }
+    if (start < toProcess.length) {
+      this.pendingRedrawEvents.unshift(...toProcess.slice(start));
+    }
+  }
+
+  private beginRedrawFrame(): void {
+    this.stagingRedrawFrame = true;
+    this.stagedCmdlineText = undefined;
+    this.stagedCmdlineCursorByte = undefined;
+    this.stagedMessageText = undefined;
+    this.stagedPopupItems = undefined;
+    this.stagedPopupSelected = undefined;
+    this.stagedSearchRefresh = false;
+  }
+
+  private endRedrawFrame(): void {
+    this.stagingRedrawFrame = false;
+    if (this.stagedCmdlineText !== undefined) {
+      this.setCmdline(this.stagedCmdlineText);
+    }
+    if (this.stagedCmdlineCursorByte !== undefined) {
+      this.setCmdlineCursor(this.stagedCmdlineCursorByte);
+    }
+    if (this.stagedMessageText !== undefined) {
+      this.setMessage(this.stagedMessageText);
+    }
+    if (this.stagedPopupItems !== undefined) {
+      this.setPopupmenu(this.stagedPopupItems, Number.isFinite(Number(this.stagedPopupSelected)) ? Number(this.stagedPopupSelected) : -1);
+    } else if (this.stagedPopupSelected !== undefined) {
+      const sel = Number(this.stagedPopupSelected);
+      this.updatePopupmenuSelection(Number.isFinite(sel) ? sel : -1);
+    }
+    if (this.stagedSearchRefresh) {
+      this.scheduleSearchHighlightRefresh();
+    }
+  }
+
+  private processRedrawFrame(events: unknown[][]): void {
+    this.beginRedrawFrame();
+    try {
+      for (const batch of events) {
+        if (!Array.isArray(batch) || batch.length === 0) continue;
+        const name = batch[0];
+        if (name === "flush") break;
+        if (typeof name !== "string") continue;
+        const rawArgs = batch.slice(1);
+        const args = rawArgs.length === 1 && Array.isArray(rawArgs[0]) ? (rawArgs[0] as unknown[]) : rawArgs;
+        this.stageRedrawEvent(name, args);
+      }
+    } finally {
+      this.endRedrawFrame();
+    }
+  }
+
+  private stageRedrawEvent(name: string, args: unknown[]): void {
+    if (name === "cmdline_hide") {
+      this.stagedCmdlineText = null;
+      this.stagedCmdlineCursorByte = null;
+      this.stagedSearchRefresh = true;
+      return;
+    }
+    if (name === "cmdline_show") {
+      const content = args[0];
+      const pos = Math.max(0, Number(args[1] ?? 0) || 0);
+      const firstc = typeof args[2] === "string" ? args[2] : "";
+      const prompt = typeof args[3] === "string" ? args[3] : "";
+      const indent = Math.max(0, Number(args[4] ?? 0) || 0);
+      const prefix = prompt ? prompt : (firstc || "");
+      const indentText = " ".repeat(indent);
+      const contentText = uiChunksToText(content);
+      const text = `${indentText}${prefix}${contentText}`;
+
+      // Keep the cursor mapping state in sync for cmdline_pos.
+      const prefixBytes = utf8StringByteLength(`${indentText}${prefix}`);
+      const contentBytes = utf8StringByteLength(contentText);
+      this.cmdlineCursorOffsetBytes = prefixBytes;
+      this.cmdlineCursorContentBytes = contentBytes;
+      const cursorByte = pos <= contentBytes ? (this.cmdlineCursorOffsetBytes + pos) : pos;
+
+      this.stagedCmdlineText = text;
+      this.stagedCmdlineCursorByte = cursorByte;
+      this.stagedSearchRefresh = true;
+      return;
+    }
+    if (name === "cmdline_pos") {
+      const pos = Math.max(0, Number(args[0] ?? 0) || 0);
+      const cursorByte = (this.cmdlineCursorOffsetBytes > 0 && pos <= this.cmdlineCursorContentBytes)
+        ? (this.cmdlineCursorOffsetBytes + pos)
+        : pos;
+      this.stagedCmdlineCursorByte = cursorByte;
+      this.stagedSearchRefresh = true;
+      return;
+    }
+    if (name === "msg_clear") {
+      this.stagedMessageText = null;
+      return;
+    }
+    if (name === "msg_show") {
+      const kind = typeof args[0] === "string" ? args[0] : "";
+      // NOTE: return_prompt is noisy and often not useful for a host UI.
+      if (kind === "return_prompt") return;
+      const content = args[1];
+      const replaceLast = Boolean(args[2]);
+      const append = Boolean(args[4]);
+      const text = uiChunksToText(content);
+      if (kind === "empty" && !text) {
+        this.stagedMessageText = null;
+        return;
+      }
+      if (!text) return;
+
+      const base =
+        this.stagedMessageText !== undefined
+          ? (this.stagedMessageText ?? "")
+          : (this.messageEl?.textContent ?? "");
+      if (append && base) {
+        this.stagedMessageText = `${base}${text}`;
+        return;
+      }
+      if (replaceLast) {
+        this.stagedMessageText = text;
+        return;
+      }
+      this.stagedMessageText = text;
+      return;
+    }
+    if (name === "msg_showmode" || name === "msg_showcmd" || name === "msg_ruler") {
+      const content = args[0];
+      const text = uiChunksToText(content);
+      this.stagedMessageText = text || null;
+      return;
+    }
+    if (name === "popupmenu_hide") {
+      this.stagedPopupItems = null;
+      this.stagedPopupSelected = -1;
+      return;
+    }
+    if (name === "popupmenu_show") {
+      const itemsRaw = args[0];
+      const selected = Number(args[1] ?? -1);
+      const items = parsePopupmenuItems(itemsRaw);
+      this.stagedPopupItems = items;
+      this.stagedPopupSelected = Number.isFinite(selected) ? selected : -1;
+      return;
+    }
+    if (name === "popupmenu_select") {
+      const selected = Number(args[0] ?? -1);
+      this.stagedPopupSelected = Number.isFinite(selected) ? selected : -1;
+      return;
+    }
+    if (name === "mode_change") {
+      const mode = typeof args[0] === "string" ? args[0] : "";
+      // `redraw` mode_change reports coarse, UI-oriented strings (e.g. "insert")
+      // that can disagree with `nvim_get_mode()` (e.g. replace / operator-pending
+      // states). We rely on `monaco_mode` (autocmd via nvim_get_mode()) for
+      // correctness and only fall back to mode_change before those autocmds
+      // are installed.
+      if (!this.hostAutocmdInstalled) this.applyNvimMode(mode);
+      return;
     }
   }
 
@@ -1953,7 +2159,7 @@ export class MonacoNeovimClient {
       this.applyScrolloff(pos);
     }
     this.suppressCursorSync = false;
-    this.scheduleSearchHighlightRefresh();
+    this.requestSearchHighlightRefresh();
   }
 
   private getScrolloffLines(): number {
@@ -2164,111 +2370,6 @@ export class MonacoNeovimClient {
     const children = Array.from(this.popupEl.children) as HTMLElement[];
     for (let i = 0; i < children.length; i += 1) {
       children[i].style.background = i === selected ? "rgba(255,255,255,0.12)" : "transparent";
-    }
-  }
-
-  private handleRedraw(params: unknown[]): void {
-    if (!Array.isArray(params)) return;
-    for (const batch of params) {
-      if (!Array.isArray(batch) || batch.length === 0) continue;
-      const name = batch[0];
-      if (typeof name !== "string") continue;
-      const rawArgs = batch.slice(1);
-      const args = rawArgs.length === 1 && Array.isArray(rawArgs[0]) ? (rawArgs[0] as unknown[]) : rawArgs;
-      if (name === "cmdline_hide") {
-        this.setCmdline(null);
-        this.scheduleSearchHighlightRefresh();
-        continue;
-      }
-      if (name === "cmdline_show") {
-        const content = args[0];
-        const pos = Math.max(0, Number(args[1] ?? 0) || 0);
-        const firstc = typeof args[2] === "string" ? args[2] : "";
-        const prompt = typeof args[3] === "string" ? args[3] : "";
-        const indent = Math.max(0, Number(args[4] ?? 0) || 0);
-        const prefix = prompt ? prompt : (firstc || "");
-        const indentText = " ".repeat(indent);
-        const contentText = uiChunksToText(content);
-        const text = `${indentText}${prefix}${contentText}`;
-        this.setCmdline(text);
-        // `pos` is in bytes; depending on the UI provider it may be relative to
-        // the typed content only, so adjust if it looks like that case.
-        const prefixBytes = utf8StringByteLength(`${indentText}${prefix}`);
-        const contentBytes = utf8StringByteLength(contentText);
-        this.cmdlineCursorOffsetBytes = prefixBytes;
-        this.cmdlineCursorContentBytes = contentBytes;
-        const cursorByte = pos <= contentBytes ? (this.cmdlineCursorOffsetBytes + pos) : pos;
-        this.setCmdlineCursor(cursorByte);
-        this.scheduleSearchHighlightRefresh();
-        continue;
-      }
-      if (name === "cmdline_pos") {
-        const pos = Math.max(0, Number(args[0] ?? 0) || 0);
-        const cursorByte = (this.cmdlineCursorOffsetBytes > 0 && pos <= this.cmdlineCursorContentBytes)
-          ? (this.cmdlineCursorOffsetBytes + pos)
-          : pos;
-        this.setCmdlineCursor(cursorByte);
-        this.scheduleSearchHighlightRefresh();
-        continue;
-      }
-      if (name === "msg_clear") {
-        this.setMessage(null);
-        continue;
-      }
-      if (name === "msg_show") {
-        const kind = typeof args[0] === "string" ? args[0] : "";
-        const content = args[1];
-        const replaceLast = Boolean(args[2]);
-        const append = Boolean(args[4]);
-        const text = uiChunksToText(content);
-        if (kind === "empty" && !text) {
-          this.setMessage(null);
-          continue;
-        }
-        if (!text) continue;
-        if (append && this.messageEl?.textContent) {
-          this.setMessage(`${this.messageEl.textContent}${text}`);
-          continue;
-        }
-        if (replaceLast) {
-          this.setMessage(text);
-          continue;
-        }
-        this.setMessage(text);
-        continue;
-      }
-      if (name === "msg_showmode" || name === "msg_showcmd" || name === "msg_ruler") {
-        const content = args[0];
-        const text = uiChunksToText(content);
-        this.setMessage(text || null);
-        continue;
-      }
-      if (name === "popupmenu_hide") {
-        this.setPopupmenu(null, -1);
-        continue;
-      }
-      if (name === "popupmenu_show") {
-        const itemsRaw = args[0];
-        const selected = Number(args[1] ?? -1);
-        const items = parsePopupmenuItems(itemsRaw);
-        this.setPopupmenu(items, Number.isFinite(selected) ? selected : -1);
-        continue;
-      }
-      if (name === "popupmenu_select") {
-        const selected = Number(args[0] ?? -1);
-        this.updatePopupmenuSelection(Number.isFinite(selected) ? selected : -1);
-        continue;
-      }
-      if (name === "mode_change") {
-        const mode = typeof args[0] === "string" ? args[0] : "";
-        // `redraw` mode_change reports coarse, UI-oriented strings (e.g. "insert")
-        // that can disagree with `nvim_get_mode()` (e.g. replace / operator-pending
-        // states). We rely on `monaco_mode` (autocmd via nvim_get_mode()) for
-        // correctness and only fall back to mode_change before those autocmds
-        // are installed.
-        if (!this.hostAutocmdInstalled) this.applyNvimMode(mode);
-        continue;
-      }
     }
   }
 
@@ -3031,7 +3132,7 @@ export class MonacoNeovimClient {
         this.suppressCursorSync = false;
       }
     }
-    this.scheduleSearchHighlightRefresh();
+    this.requestSearchHighlightRefresh();
   }
 
   private setEditorReadOnly(readOnly: boolean): void {
@@ -3942,7 +4043,7 @@ vim.rpcnotify(chan, "monaco_buf_enter", {
     }
 
     if (this.opts.syncTabstop) this.syncTabstopFromMonaco();
-    this.scheduleSearchHighlightRefresh();
+    this.requestSearchHighlightRefresh();
   }
 
   private handleBufDelete(arg: Record<string, unknown>): void {
@@ -4057,6 +4158,15 @@ vim.rpcnotify(chan, "monaco_buf_enter", {
       const applied = this.applyScrolloff(this.lastCursorPos);
       if (!applied) this.editor.revealPositionInCenterIfOutsideViewport(this.lastCursorPos);
       this.suppressCursorSync = false;
+    }
+    this.requestSearchHighlightRefresh();
+  }
+
+  private requestSearchHighlightRefresh(): void {
+    if (!this.opts.searchHighlights) return;
+    if (this.stagingRedrawFrame) {
+      this.stagedSearchRefresh = true;
+      return;
     }
     this.scheduleSearchHighlightRefresh();
   }
