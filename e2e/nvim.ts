@@ -62,7 +62,12 @@ export async function getMonacoDecorationCounts(page: Page): Promise<{ visual: n
     if (!model || typeof (model as any).getAllDecorations !== "function") return { visual: 0, search: 0 };
     const all = (model as any).getAllDecorations() as Array<{ options?: any }> | null;
     const decos = Array.isArray(all) ? all : [];
-    const visual = decos.filter((d) => d?.options?.inlineClassName === "monaco-neovim-visual-inline" || d?.options?.className === "monaco-neovim-visual-line").length;
+    const visual = decos.filter((d) => d?.options?.inlineClassName === "monaco-neovim-visual-inline"
+      || d?.options?.className === "monaco-neovim-visual-inline"
+      || d?.options?.className === "monaco-neovim-visual-line").length
+      // Visual-block highlights are rendered via a DOM overlay to support virtual
+      // spaces past EOL.
+      + document.querySelectorAll(".monaco-neovim-visual-virtual").length;
     const search = decos.filter((d) => d?.options?.inlineClassName === "monaco-neovim-search-current" || d?.options?.inlineClassName === "monaco-neovim-search-match").length;
     return { visual, search };
   });

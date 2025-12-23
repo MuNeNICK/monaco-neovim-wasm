@@ -30,6 +30,36 @@ test.describe("Monaco Neovim WASM - Vim E2E", () => {
     await waitForCursor(page, { row: 1, col: 4 });
   });
 
+  test("insert: cursor stable after arrows + escape", async ({ page }) => {
+    await setBuffer(page, ["abcd"]);
+    await page.keyboard.press("0");
+    await page.keyboard.press("i");
+    await waitForMode(page, "i");
+    await page.keyboard.type("XYZ", { delay: keyDelayMs });
+    await page.keyboard.press("ArrowLeft");
+    await page.keyboard.press("ArrowLeft");
+    await page.keyboard.type("!", { delay: keyDelayMs });
+    await page.keyboard.press("Escape");
+    await waitForMode(page, "n");
+    await waitForNvimBuffer(page, ["X!YZabcd"]);
+    await waitForCursor(page, { row: 1, col: 1 });
+  });
+
+  test("delegated insert: multiline then escape keeps cursor on last inserted char", async ({ page }) => {
+    await setBuffer(page, [""]);
+    await page.keyboard.press("i");
+    await waitForMode(page, "i");
+    await page.keyboard.type("aiueo", { delay: keyDelayMs });
+    await page.keyboard.press("Enter");
+    await page.keyboard.type("aiueo", { delay: keyDelayMs });
+    await page.keyboard.press("Enter");
+    await page.keyboard.type("aiueo", { delay: keyDelayMs });
+    await page.keyboard.press("Escape");
+    await waitForMode(page, "n");
+    await waitForNvimBuffer(page, ["aiueo", "aiueo", "aiueo"]);
+    await waitForCursor(page, { row: 3, col: 4 });
+  });
+
   test("basic motions: w/b/0/$/gg/G", async ({ page }) => {
     await setBuffer(page, ["alpha beta gamma", "second line"]);
 
@@ -102,6 +132,44 @@ test.describe("Monaco Neovim WASM - Vim E2E", () => {
     await waitForMode(page, "n");
     await page.keyboard.press("p");
     await waitForNvimBuffer(page, ["aabcbcdef"]);
+  });
+
+  test("visual mode: entering does not move cursor", async ({ page }) => {
+    await setBuffer(page, ["alpha beta", "second line"]);
+    await page.keyboard.press("j");
+    await page.keyboard.press("w");
+    const before = await getCursor(page);
+    await page.keyboard.press("v");
+    await waitForMode(page, "v");
+    await expect.poll(async () => await getCursor(page)).toEqual(before);
+    await page.keyboard.press("Escape");
+    await waitForMode(page, "n");
+  });
+
+  test("mouse click then visual: cursor does not jump", async ({ page }) => {
+    await setBuffer(page, ["abcdef", "ghijkl"]);
+    await page.evaluate(() => (window as any).monacoEditor?.layout?.());
+
+    const { x, y } = await page.evaluate(() => {
+      const editor = (window as any).monacoEditor;
+      if (!editor) throw new Error("window.monacoEditor missing");
+      const root = editor.getDomNode?.();
+      if (!root) throw new Error("editor dom missing");
+      const rootRect = root.getBoundingClientRect();
+      const sp = editor.getScrolledVisiblePosition?.({ lineNumber: 2, column: 3 });
+      if (!sp) throw new Error("no scrolled position");
+      return { x: rootRect.left + sp.left + 1, y: rootRect.top + sp.top + Math.floor(sp.height / 2) };
+    });
+
+    await page.mouse.click(x, y);
+    await waitForCursor(page, { row: 2, col: 2 });
+
+    const before = await getCursor(page);
+    await page.keyboard.press("v");
+    await waitForMode(page, "v");
+    await expect.poll(async () => await getCursor(page)).toEqual(before);
+    await page.keyboard.press("Escape");
+    await waitForMode(page, "n");
   });
 
   test("visual: escape exits and clears decorations", async ({ page }) => {
@@ -303,7 +371,6 @@ test.describe("Monaco Neovim WASM - Vim E2E", () => {
   });
 
   test("repeat: . (dot) after insert (including backspace)", async ({ page }) => {
-    test.fail(true, "TODO: Monaco委譲のinsert入力ではNeovimの.が挿入文字列を記録できていない");
     await setBuffer(page, ["aaa bbb", "aaa bbb"]);
 
     await page.keyboard.type("cw", { delay: keyDelayMs });
@@ -339,8 +406,8 @@ test.describe("Monaco Neovim WASM - Vim E2E", () => {
     await page.keyboard.press("Escape");
     await waitForMode(page, "n");
     await waitForNvimBuffer(page, ["aあうb"]);
-    await waitForCursor(page, { row: 1, col: 7 });
-    await waitForMonacoCursor(page, { row: 1, col: 4 });
+    await waitForCursor(page, { row: 1, col: 4 });
+    await waitForMonacoCursor(page, { row: 1, col: 3 });
   });
 
   test("find-char motions: f/t + ;/,", async ({ page }) => {
@@ -420,6 +487,24 @@ test.describe("Monaco Neovim WASM - Vim E2E", () => {
     await page.keyboard.type("> ", { delay: keyDelayMs });
     await page.keyboard.press("Escape");
     await waitForNvimBuffer(page, ["> a", "> b", "> c"]);
+    await page.keyboard.press("Escape");
+    await waitForMode(page, "n");
+    await waitForNoMonacoVisualDecorations(page);
+  });
+
+  test("visual block: highlights virtual spaces past EOL", async ({ page }) => {
+    await execLua(page, `vim.o.virtualedit = "block"; return true`);
+    await setBuffer(page, ["abcd", "a"]);
+
+    await page.keyboard.press("Control+V");
+    await waitForMode(page, "\u0016");
+    await page.keyboard.press("j");
+    await page.keyboard.type("4|", { delay: keyDelayMs });
+    await expect.poll(async () => await execLua<number>(page, `return vim.fn.virtcol(".")`)).toBe(4);
+
+    await waitForMonacoVisualDecorations(page, 1);
+    await expect.poll(async () => await page.locator(".monaco-neovim-visual-virtual").count()).toBeGreaterThan(0);
+
     await page.keyboard.press("Escape");
     await waitForMode(page, "n");
     await waitForNoMonacoVisualDecorations(page);

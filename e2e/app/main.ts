@@ -24,6 +24,11 @@ const editor = monaco.editor.create(editorHost, {
   theme: "vs-dark",
   fontSize: 14,
   readOnly: false,
+  // Avoid flaky <Enter> behavior in delegated insert: Monaco suggestions can
+  // steal Enter and change the resulting buffer in ways unrelated to Neovim.
+  quickSuggestions: false,
+  suggestOnTriggerCharacters: false,
+  acceptSuggestionOnEnter: "off",
   minimap: { enabled: false },
   automaticLayout: true,
 });

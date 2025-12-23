@@ -188,19 +188,41 @@ const DEFAULT_SEED = [
 ];
 
 const VISUAL_SELECTION_LUA = `
-local api, fn = vim.api, vim.fn
+	local api, fn = vim.api, vim.fn
 
-local function virtcol2byte(winid, lnum, virtcol)
-  local byte_idx = fn.virtcol2col(winid, lnum, virtcol) - 1
-  if fn.has("nvim-0.10.0") == 0 then
-    return byte_idx
-  end
-  local buf = api.nvim_win_get_buf(winid)
-  local line = api.nvim_buf_get_lines(buf, lnum - 1, lnum, false)[1] or ""
-  local char_idx = fn.charidx(line, byte_idx)
-  local prefix = fn.strcharpart(line, 0, char_idx + 1)
-  return #prefix
-end
+	-- virtcol2col() returns a column (1-indexed) for the given virtual column.
+	-- Neovim <= 0.9 returns the *last* byte of a multibyte character, while Neovim >= 0.10 returns the *first* byte.
+	-- For our byte<->Monaco conversion we always want the 0-indexed *first* byte of the character.
+	local function virtcol2byte0(winid, lnum, virtcol)
+	  local byte0 = fn.virtcol2col(winid, lnum, virtcol) - 1
+	  if fn.has("nvim-0.10.0") == 1 then
+	    return byte0
+	  end
+	  local buf = api.nvim_win_get_buf(winid)
+	  local line = api.nvim_buf_get_lines(buf, lnum - 1, lnum, false)[1] or ""
+	  local char_idx = fn.charidx(line, byte0)
+	  local prefix = fn.strcharpart(line, 0, char_idx)
+	  return #prefix
+	end
+
+	local function char_width_at_byte0(line, byte0)
+	  if not line or line == "" then return 1, "" end
+	  local b = math.max(0, math.min(#line, byte0 or 0))
+	  local char_idx = fn.charidx(line, b)
+	  local ch = fn.strcharpart(line, char_idx, 1)
+	  if ch == "\\t" then return 1, ch end
+	  local w = fn.strdisplaywidth(ch)
+	  if not w or w < 1 then w = 1 end
+	  return w, ch
+	end
+
+	local function start_vcol_at_byte0(line, byte0)
+	  if not line or line == "" then return 1 end
+	  local b = math.max(0, math.min(#line, byte0 or 0))
+	  local char_idx = fn.charidx(line, b)
+	  local prefix = fn.strcharpart(line, 0, char_idx)
+	  return fn.strdisplaywidth(prefix) + 1
+	end
 
 local function get_selections(win)
   win = win or api.nvim_get_current_win()
@@ -244,21 +266,59 @@ local function get_selections(win)
     return { range }
   end
 
-  local ranges = {}
-  local start_vcol, end_vcol = fn.virtcol("v"), fn.virtcol(".")
-  local top, bot = math.min(sline, eline), math.max(sline, eline)
-  for lnum = top, bot do
-    local line = api.nvim_buf_get_lines(buf, lnum, lnum + 1, false)[1] or ""
-    local disp = fn.strdisplaywidth(line)
-    if start_vcol > disp and end_vcol > disp then
-      local chars = ({ vim.str_utfindex(line) })[2]
-      table.insert(ranges, { start = { line = lnum, col = chars }, ["end"] = { line = lnum, col = chars }, inclusive = true })
-    else
-      local col_a = virtcol2byte(win, lnum + 1, math.min(start_vcol, end_vcol))
-      local col_b = virtcol2byte(win, lnum + 1, math.max(start_vcol, end_vcol))
-      table.insert(ranges, { start = { line = lnum, col = col_a }, ["end"] = { line = lnum, col = col_b }, inclusive = true })
-    end
-  end
+	  local ranges = {}
+	  local inclusive = (vim.o.selection or "inclusive") == "inclusive"
+	  local start_vcol, end_vcol = fn.virtcol("v"), fn.virtcol(".")
+	  if not inclusive then
+	    -- 'selection=exclusive' excludes the cursor column from Visual selections.
+	    if end_vcol >= start_vcol then
+	      end_vcol = end_vcol - 1
+	    else
+	      end_vcol = end_vcol + 1
+	    end
+	    if end_vcol < 1 then end_vcol = 1 end
+	  end
+	  local left_vcol, right_vcol = math.min(start_vcol, end_vcol), math.max(start_vcol, end_vcol)
+	  local top, bot = math.min(sline, eline), math.max(sline, eline)
+	  for lnum = top, bot do
+	    local line = api.nvim_buf_get_lines(buf, lnum, lnum + 1, false)[1] or ""
+	    local disp = fn.strdisplaywidth(line)
+	    local line_bytes = #line
+	    local col_a = left_vcol > disp and line_bytes or virtcol2byte0(win, lnum + 1, left_vcol)
+	    local col_b = right_vcol > disp and line_bytes or virtcol2byte0(win, lnum + 1, right_vcol)
+	    if col_a > line_bytes then col_a = line_bytes end
+	    if col_b > line_bytes then col_b = line_bytes end
+
+	    local eff_left_vcol = left_vcol
+	    if left_vcol <= disp then
+	      local start_vcol_a = start_vcol_at_byte0(line, col_a)
+	      local w_a, ch_a = char_width_at_byte0(line, col_a)
+	      if ch_a ~= "\\t" and w_a > 1 and eff_left_vcol > start_vcol_a then
+	        eff_left_vcol = start_vcol_a
+	      end
+	    end
+
+	    local eff_right_vcol = right_vcol
+	    if right_vcol <= disp then
+	      local start_vcol_b = start_vcol_at_byte0(line, col_b)
+	      local w_b, ch_b = char_width_at_byte0(line, col_b)
+	      if ch_b ~= "\\t" and w_b > 1 then
+	        eff_right_vcol = start_vcol_b + (w_b - 1)
+	      end
+	    end
+
+	    if eff_right_vcol < eff_left_vcol then
+	      eff_left_vcol, eff_right_vcol = eff_right_vcol, eff_left_vcol
+	    end
+	    table.insert(ranges, {
+	      start = { line = lnum, col = col_a },
+	      ["end"] = { line = lnum, col = col_b },
+	      inclusive = inclusive,
+	      start_vcol = eff_left_vcol,
+	      end_vcol = eff_right_vcol,
+	      disp = disp,
+	    })
+	  end
 
   if #ranges == 0 then
     local cur = api.nvim_win_get_cursor(win)
@@ -270,8 +330,9 @@ local function get_selections(win)
   return ranges
 end
 
-return get_selections(...)
-`;
+	local tail = (api.nvim_get_mode().mode or ""):sub(-1)
+	return { tail = tail, ranges = get_selections(...) }
+	`;
 
 const SEARCH_HIGHLIGHT_LUA = `
 local api, fn = vim.api, vim.fn
@@ -381,7 +442,14 @@ export class MonacoNeovimClient {
   private visualSelectionActive = false;
   private visualDecorationIds: string[] = [];
   private visualStyleEl: HTMLStyleElement | null = null;
+  private visualVirtualOverlayEl: HTMLDivElement | null = null;
+  private visualVirtualRawRanges: any[] = [];
+  private visualVirtualActive = false;
   private visualBgCss = "rgba(62, 68, 81, 0.45)";
+  private monacoPrevOccurrencesHighlight: ("off" | "singleFile" | "multiFile") | null = null;
+  private monacoPrevSelectionHighlight: boolean | null = null;
+  private monacoPrevSelectionHighlightMultiline: boolean | null = null;
+  private monacoHighlightsSuppressed = false;
   private cursorRefreshTimer: number | null = null;
   private cursorRefreshInFlight = false;
   private cursorRefreshPending = false;
@@ -427,11 +495,18 @@ export class MonacoNeovimClient {
   private compositionActive = false;
   private pendingResyncAfterComposition = false;
   private ignoreNextInputEvent = false;
+  private pendingEscAfterComposition = false;
   private exitingInsertMode = false;
   private pendingKeysAfterExit = "";
   private exitInsertTimer: number | null = null;
   private dotRepeatKeys = "";
   private dotRepeatBackspaces = 0;
+  private delegatedInsertReplayPossible = false;
+  private recentNormalKeys = "";
+  private lastDelegatedInsertPrefix: string | null = null;
+  private lastDelegatedDotRepeat: { prefix: string; keys: string } | null = null;
+  private ignoreInsertExitCursor: { line: number; col0: number; untilMs: number } | null = null;
+  private ignoreMonacoCursorSyncToNvimUntil = 0;
   private ignoreTextKeydownUntil = 0;
   private lastImeCommitAt = 0;
   private lastImeCommitText = "";
@@ -442,10 +517,13 @@ export class MonacoNeovimClient {
   private optimisticCursorPos: monaco.Position | null = null;
   private optimisticCursorPrevPos: monaco.Position | null = null;
   private delegateInsertToMonaco = false;
+  private editorReadOnly: boolean | null = null;
   private applyingFromNvim = false;
   private buffers = new Map<number, BufferState>();
   private buffersByName = new Map<string, number>();
   private cursorSyncTimer: number | null = null;
+  private ignoreSelectionSyncUntil = 0;
+  private ignoreActiveBufLinesEventsUntil = 0;
   private modelContentDisposable: monaco.IDisposable | null = null;
   private originalOptions: Partial<MonacoEditor.IStandaloneEditorConstructionOptions> | null = null;
   private resyncTimer: number | null = null;
@@ -453,11 +531,15 @@ export class MonacoNeovimClient {
   private debugLog(line: string): void {
     if (!this.opts.debug) return;
     try {
-      const msg = `[monaco-neovim] ${line}`;
+      const msg = `[monaco-neovim-wasm] ${line}`;
       if (this.opts.debugLog) this.opts.debugLog(msg);
-      else if (typeof console !== "undefined" && console.debug) console.debug(msg);
+      else if (typeof console !== "undefined") console.log(msg);
     } catch (_) {
     }
+  }
+
+  private nowMs(): number {
+    return (typeof performance !== "undefined" && performance.now ? performance.now() : Date.now());
   }
 
   private scheduleRecordingRefresh(): void {
@@ -489,6 +571,22 @@ export class MonacoNeovimClient {
 
   constructor(editor: MonacoEditor.IStandaloneCodeEditor, options: MonacoNeovimOptions = {}) {
     this.editor = editor;
+    const debugFromGlobal = (() => {
+      try { return Boolean((globalThis as any)?.__MONACO_NEOVIM_WASM_DEBUG__); } catch (_) { return false; }
+    })();
+    const debugFromQuery = (() => {
+      try {
+        if (typeof location === "undefined" || !location?.search) return false;
+        const qs = new URLSearchParams(location.search);
+        return qs.has("monaco-neovim-wasm-debug") || qs.has("mnw_debug");
+      } catch (_) {
+        return false;
+      }
+    })();
+    const debugAuto = debugFromGlobal || debugFromQuery;
+    // Query/global debugging must be able to override an app's default `debug: false`
+    // without requiring local code changes (useful for private playgrounds).
+    const debug = debugAuto ? true : Boolean(options.debug);
     this.opts = {
       worker: options.worker ?? null,
       workerUrl: options.workerUrl ?? new URL("./nvimWorker.js", import.meta.url),
@@ -553,7 +651,7 @@ export class MonacoNeovimClient {
       onPopupmenu: options.onPopupmenu,
       cmdlineContainer: options.cmdlineContainer,
       insertSyncDebounceMs: Number.isFinite(options.insertSyncDebounceMs as any) ? Math.max(0, Number(options.insertSyncDebounceMs)) : 20,
-      debug: options.debug ?? false,
+      debug,
       debugLog: options.debugLog,
       shouldHandleKey: options.shouldHandleKey ?? (() => true),
       translateKey: options.translateKey ?? translateKey,
@@ -564,6 +662,10 @@ export class MonacoNeovimClient {
     this.altKeysInsert = this.opts.altKeysForInsertMode ? new Set(this.opts.altKeysForInsertMode.map((s) => String(s).toLowerCase())) : null;
     this.metaKeysNormal = this.opts.metaKeysForNormalMode ? new Set(this.opts.metaKeysForNormalMode.map((s) => String(s).toLowerCase())) : null;
     this.metaKeysInsert = this.opts.metaKeysForInsertMode ? new Set(this.opts.metaKeysForInsertMode.map((s) => String(s).toLowerCase())) : null;
+    if (this.opts.debug) {
+      this.opts.status?.(`[monaco-neovim-wasm] debug enabled`);
+      this.debugLog("debug enabled");
+    }
   }
 
   async start(seedLines?: string[]): Promise<void> {
@@ -826,9 +928,12 @@ export class MonacoNeovimClient {
       }
     }
 
-    // Keep the editor writable so IME composition works correctly. We still
-    // prevent most keydown-driven edits and rely on Neovim as the source of truth.
-    this.editor.updateOptions({ readOnly: false, domReadOnly: false });
+    // Default to read-only outside of insert-mode delegation. This prevents
+    // Monaco's native edit context / beforeinput pipeline from applying edits
+    // that slip past our event interception in normal/visual/operator modes.
+    // Keep `domReadOnly` false so cmdline/search can still use IME/text events.
+    this.setEditorReadOnly(!this.delegateInsertToMonaco);
+    this.editor.updateOptions({ domReadOnly: false });
     if (this.opts.syncWrap) {
       const col = this.uiCols || this.opts.cols;
       if (col > 0) this.applyMonacoWrap(col);
@@ -837,7 +942,7 @@ export class MonacoNeovimClient {
     this.attachActiveModelListener();
 
     this.disposables.push(
-      this.editor.onDidChangeModel(() => this.attachActiveModelListener()),
+      this.editor.onDidChangeModel(() => this.handleActiveModelChanged()),
       this.editor.onKeyDown((ev) => this.handleKey(ev)),
       this.editor.onMouseDown((ev) => this.handleMouse(ev)),
       this.editor.onDidChangeCursorSelection((ev) => this.handleSelection(ev)),
@@ -849,6 +954,9 @@ export class MonacoNeovimClient {
           this.scheduleCursorSyncToNvim();
           return;
         }
+        if (this.nowMs() < this.ignoreMonacoCursorSyncToNvimUntil && ev.source !== "mouse") {
+          return;
+        }
         // During IME composition, Monaco moves its internal cursor/selection.
         // Don't fight it, otherwise the view can glitch until composition ends.
         if (this.compositionActive) {
@@ -856,10 +964,20 @@ export class MonacoNeovimClient {
           return;
         }
         if (this.suppressCursorSync || !this.lastCursorPos) return;
+        if (ev.source === "mouse") {
+          // Keep Neovim's cursor in sync with mouse-driven Monaco cursor moves.
+          // Relying solely on `onMouseDown` can miss cases where Monaco moves the
+          // caret without a text-target position (e.g. clicking padding/whitespace),
+          // which later manifests as a "cursor jump" when entering visual mode.
+          const sel = this.editor.getSelection();
+          if (sel && sel.isEmpty()) this.syncCursorToNvimNow(true);
+          return;
+        }
         if (ev.source === "keyboard") {
           this.suppressCursorSync = true;
           this.editor.setPosition(this.lastCursorPos);
           this.suppressCursorSync = false;
+          return;
         }
       }),
       this.editor.onDidScrollChange(() => {
@@ -872,6 +990,37 @@ export class MonacoNeovimClient {
         if (!this.opts.searchHighlights) return;
         if (this.compositionActive) return;
         this.scheduleSearchHighlightRefresh();
+      }),
+    );
+    this.disposables.push(
+      this.editor.onDidScrollChange(() => {
+        if (!this.visualVirtualActive) return;
+        this.renderVisualVirtualOverlay();
+      }),
+      this.editor.onDidLayoutChange(() => {
+        if (!this.visualVirtualActive) return;
+        this.renderVisualVirtualOverlay();
+      }),
+      this.editor.onDidChangeConfiguration((e) => {
+        if (!this.visualVirtualActive) return;
+        if (
+          e.hasChanged(EditorOption.fontInfo)
+          || e.hasChanged(EditorOption.lineHeight)
+          || e.hasChanged(EditorOption.fontSize)
+          || e.hasChanged(EditorOption.fontFamily)
+        ) {
+          this.renderVisualVirtualOverlay();
+        }
+      }),
+    );
+    this.disposables.push(
+      this.editor.onDidChangeConfiguration((e) => {
+        // Some hosts update editor options after we attach. Ensure normal mode
+        // stays read-only so typed characters can't mutate the model behind
+        // Neovim's back (desync: Monaco shows text Neovim doesn't have).
+        if (e.hasChanged(EditorOption.readOnly) && !this.delegateInsertToMonaco) {
+          this.setEditorReadOnly(true);
+        }
       }),
     );
     if (this.opts.autoResize) {
@@ -891,6 +1040,53 @@ export class MonacoNeovimClient {
     }
     this.initCmdlineUi();
     this.initTextInputListeners();
+  }
+
+  private handleActiveModelChanged(): void {
+    this.attachActiveModelListener();
+    if (!this.session || !this.session.isRunning()) return;
+    if (!this.bufHandle) return;
+    const model = this.editor.getModel();
+    if (!model) return;
+
+    // If the host swaps Monaco models (e.g. file open), ensure Neovim stays in sync.
+    // This prevents "inserted text not recognized by Neovim" desyncs when the
+    // active model diverges from the buffer state we flush to.
+    try {
+      const uri = (model as any).uri as monaco.Uri | undefined;
+      const scheme = uri?.scheme ?? "";
+      const authority = uri?.authority ?? "";
+      const path = uri?.path ?? "";
+      if (scheme === "nvim" && authority === "buf") {
+        const m = /^\/(\d+)$/.exec(path);
+        const id = m ? Number(m[1]) : NaN;
+        if (Number.isFinite(id) && id > 0) {
+          this.bufHandle = id;
+        }
+      }
+    } catch (_) {
+    }
+
+    const state = this.ensureActiveState();
+    if (!state) return;
+    if (state.model === model) return;
+
+    this.debugLog(`active model changed: rebind buf=${this.bufHandle}`);
+    state.model = model;
+    state.createdModel = false;
+    state.pendingBufEdits = [];
+    state.pendingFullSync = false;
+    state.pendingCursorSync = false;
+    state.shadowLines = this.delegateInsertToMonaco ? (model.getLinesContent?.() ?? null) : null;
+
+    try {
+      // Treat the new model content as the new source of truth for the current buffer.
+      // Neovim will emit nvim_buf_lines_event and we will re-render.
+      const lines = model.getLinesContent?.() ?? model.getValue().split(/\r?\n/);
+      this.sendNotify("nvim_buf_set_lines", [this.bufHandle, 0, -1, false, lines]);
+      this.syncCursorToNvimNow(true);
+    } catch (_) {
+    }
   }
 
   private computeGridSize(): { cols: number; rows: number } {
@@ -1023,6 +1219,7 @@ export class MonacoNeovimClient {
     }
     this.clearVisualDecorations();
     this.clearSearchHighlights();
+    this.setMonacoHighlightsSuppressed(false);
     if (this.searchStyleEl) {
       try { this.searchStyleEl.remove(); } catch (_) {}
       this.searchStyleEl = null;
@@ -1031,6 +1228,12 @@ export class MonacoNeovimClient {
       try { this.visualStyleEl.remove(); } catch (_) {}
       this.visualStyleEl = null;
     }
+    if (this.visualVirtualOverlayEl) {
+      try { this.visualVirtualOverlayEl.remove(); } catch (_) {}
+      this.visualVirtualOverlayEl = null;
+    }
+    this.visualVirtualRawRanges = [];
+    this.visualVirtualActive = false;
     if (this.cmdlineEl) {
       try { this.cmdlineEl.remove(); } catch (_) {}
       this.cmdlineEl = null;
@@ -1084,6 +1287,7 @@ export class MonacoNeovimClient {
       try { this.editor.updateOptions(this.originalOptions); } catch (_) {}
       this.originalOptions = null;
     }
+    this.editorReadOnly = null;
   }
 
   private attachActiveModelListener(): void {
@@ -1217,7 +1421,7 @@ export class MonacoNeovimClient {
       const arg = params?.[0];
       if (arg && typeof arg === "object") {
         this.applyMonacoCursorMove(arg as Record<string, unknown>);
-        this.syncCursorToNvimNow();
+        if (!this.exitingInsertMode) this.syncCursorToNvimNow(true);
       }
       return;
     }
@@ -1225,7 +1429,7 @@ export class MonacoNeovimClient {
       const arg = params?.[0];
       if (arg && typeof arg === "object") {
         const moved = this.applyMonacoScroll(arg as Record<string, unknown>);
-        if (moved) this.syncCursorToNvimNow();
+        if (moved && !this.exitingInsertMode) this.syncCursorToNvimNow(true);
       }
       return;
     }
@@ -1233,7 +1437,7 @@ export class MonacoNeovimClient {
       const arg = params?.[0];
       if (arg && typeof arg === "object") {
         const resetCursor = this.applyMonacoReveal(arg as Record<string, unknown>);
-        if (resetCursor) this.syncCursorToNvimNow();
+        if (resetCursor && !this.exitingInsertMode) this.syncCursorToNvimNow(true);
       }
       return;
     }
@@ -1241,7 +1445,7 @@ export class MonacoNeovimClient {
       const arg = params?.[0];
       if (arg && typeof arg === "object") {
         this.applyMonacoMoveCursor(arg as Record<string, unknown>);
-        this.syncCursorToNvimNow();
+        if (!this.exitingInsertMode) this.syncCursorToNvimNow(true);
       }
       return;
     }
@@ -1276,9 +1480,33 @@ export class MonacoNeovimClient {
     }
     if (method === "monaco_cursor") {
       const [ln, col0] = params;
+      // If we explicitly synced the insert-mode cursor right before sending <Esc>,
+      // Neovim can emit a late CursorMovedI event for that *insert* position after
+      // it has already left insert mode. Ignoring it prevents the caret from
+      // jumping forward by 1 column right after exiting insert.
+      try {
+        const g = this.ignoreInsertExitCursor;
+        const now = this.nowMs();
+        if (
+          g
+          && now < g.untilMs
+          && !this.delegateInsertToMonaco
+          && Number(ln) === g.line
+          && Number(col0) === g.col0
+          && g.col0 > 0
+        ) {
+          this.debugLog(`nvim->monaco cursor: ignore stale post-exit insert cursor ln=${Number(ln)} col0=${Number(col0)}`);
+          return;
+        }
+        if (g && now >= g.untilMs) this.ignoreInsertExitCursor = null;
+      } catch (_) {
+      }
       const clamped = clampCursor(this.editor, Number(ln), Number(col0));
+      this.debugLog(`nvim->monaco cursor: ln=${Number(ln)} col0=${Number(col0)} -> line=${clamped.line} col=${clamped.col} delegateInsert=${this.delegateInsertToMonaco} exitingInsert=${this.exitingInsertMode} mode=${JSON.stringify(this.lastMode)}`);
       // In insert-mode delegation, Monaco owns the caret; don't overwrite it.
-      if (this.delegateInsertToMonaco) {
+      // While exiting insert mode we do want to accept Neovim cursor updates so
+      // the UI doesn't "jump" when the mode change arrives slightly later.
+      if (this.delegateInsertToMonaco && !this.exitingInsertMode) {
         const model = this.editor.getModel();
         const validated = model
           ? model.validatePosition(new monaco.Position(clamped.line, clamped.col))
@@ -1292,6 +1520,14 @@ export class MonacoNeovimClient {
     }
     if (method === "monaco_mode") {
       const m = typeof params?.[0] === "string" ? String(params[0]) : "";
+      if (!this.hostAutocmdInstalled) {
+        // Some environments can have the host autocmd Lua installed even if the
+        // initial installation call didn't resolve cleanly. Once we observe a
+        // monaco_mode notify, treat it as authoritative and stop using `redraw`
+        // mode_change to avoid mode flip-flop (normal/insert vs n/i).
+        this.hostAutocmdInstalled = true;
+      }
+      this.debugLog(`nvim->monaco mode: ${JSON.stringify(this.lastMode)} -> ${JSON.stringify(m)}`);
       this.applyNvimMode(m);
       return;
     }
@@ -1306,6 +1542,14 @@ export class MonacoNeovimClient {
       if (!id) return;
       const state = (this.bufHandle != null && id === this.bufHandle) ? this.ensureActiveState() : (this.buffers.get(id) ?? null);
       if (!state) return;
+      if (this.bufHandle != null && id === this.bufHandle && this.delegateInsertToMonaco && !this.exitingInsertMode) {
+        // During insert-mode delegation, Monaco is the source of truth for the
+        // document. Neovim will echo our Monaco->Neovim changes back via
+        // nvim_buf_lines_event; applying them can create feedback loops and
+        // corrupt the model when patches are computed on partially-updated state.
+        // Ignore the echo window right after we flush Monaco edits to Neovim.
+        if (this.nowMs() < this.ignoreActiveBufLinesEventsUntil) return;
+      }
       if (this.bufHandle != null && id === this.bufHandle && this.compositionActive) {
         // Don't mutate the Monaco model during IME composition; it can cause the
         // IME rendering/caret to glitch. We'll resync after composition ends.
@@ -1326,7 +1570,13 @@ export class MonacoNeovimClient {
             let isNoop = false;
             try { isNoop = model!.getValueInRange(patch.range) === patch.text; } catch (_) {}
             if (!isNoop) {
-              if (state.pendingFullSync || state.pendingBufEdits.length) return;
+              if (state.pendingFullSync || state.pendingBufEdits.length) {
+                // We're in the middle of applying Monaco->Neovim edits; applying
+                // Neovim line events now can race with our pending patches.
+                // Instead, resync the active buffer shortly.
+                this.scheduleResync();
+                return;
+              }
               this.applyLinePatchToModel(model!, fl, ll, newLines!);
               try { state.shadowLines = model!.getLinesContent(); } catch (_) {}
             }
@@ -1971,7 +2221,12 @@ export class MonacoNeovimClient {
       }
       if (name === "mode_change") {
         const mode = typeof args[0] === "string" ? args[0] : "";
-        this.applyNvimMode(mode);
+        // `redraw` mode_change reports coarse, UI-oriented strings (e.g. "insert")
+        // that can disagree with `nvim_get_mode()` (e.g. replace / operator-pending
+        // states). We rely on `monaco_mode` (autocmd via nvim_get_mode()) for
+        // correctness and only fall back to mode_change before those autocmds
+        // are installed.
+        if (!this.hostAutocmdInstalled) this.applyNvimMode(mode);
         continue;
       }
     }
@@ -1980,6 +2235,8 @@ export class MonacoNeovimClient {
   private initTextInputListeners(): void {
     const root = this.editor.getDomNode();
     if (!root) return;
+    const ownerDoc = root.ownerDocument || document;
+    const view: EventTarget = ownerDoc.defaultView || window;
 
     const nowMs = () => (typeof performance !== "undefined" && performance.now ? performance.now() : Date.now());
 
@@ -1988,32 +2245,64 @@ export class MonacoNeovimClient {
       try { e.stopPropagation(); } catch (_) {}
     };
 
-    const asInputTarget = (target: EventTarget | null): HTMLElement | null => {
+    const isEditorEvent = (e: Event): boolean => {
+      try {
+        const hasTextFocus = typeof (this.editor as any).hasTextFocus === "function"
+          ? Boolean((this.editor as any).hasTextFocus())
+          : false;
+        if (hasTextFocus) return true;
+        const target = e.target as Node | null;
+        if (target && root.contains(target)) return true;
+        const active = ownerDoc.activeElement as Node | null;
+        return Boolean(active && root.contains(active));
+      } catch (_) {
+        return false;
+      }
+    };
+
+    const asMaybeInputTarget = (target: EventTarget | null): HTMLElement | null => {
       try {
         const el = target as HTMLElement | null;
         if (!el || typeof (el as any).tagName !== "string") return null;
-        const tag = (el as any).tagName;
-        if (tag === "TEXTAREA") {
-          // Monaco <0.5x: textarea.inputarea ; Monaco >=0.55: textarea.ime-text-area.
-          if (el.classList?.contains?.("inputarea") || el.classList?.contains?.("ime-text-area")) return el;
-          return null;
-        }
-        if (tag === "DIV") {
-          // Monaco >=0.55: native edit context div receives beforeinput/input.
-          if (el.classList?.contains?.("native-edit-context")) return el;
-          return null;
-        }
-        return null;
+        return el;
       } catch (_) {
         return null;
       }
     };
 
     const onKeydownCapture = (e: KeyboardEvent) => {
+      if (!isEditorEvent(e)) return;
       if (this.compositionActive || e.isComposing) return;
       if (e.getModifierState?.("AltGraph")) return;
 
       const insertMode = this.delegateInsertToMonaco && !this.exitingInsertMode;
+      if (insertMode) {
+        // Escape must reliably exit insert mode even when Monaco keydown
+        // handling is bypassed by the native edit context / browser.
+        if (e.key === "Escape") {
+          if (!this.opts.shouldHandleKey(e)) return;
+          stopAll(e);
+          try { e.preventDefault(); } catch (_) {}
+          if (this.compositionActive || e.isComposing) {
+            this.pendingEscAfterComposition = true;
+            return;
+          }
+          this.exitDelegatedInsertMode("<Esc>");
+          return;
+        }
+        // If the user navigates or performs non-trivial edits while delegating,
+        // we can't safely replay them as Neovim input for dot-repeat.
+        const k = e.key;
+        if (
+          k === "ArrowLeft" || k === "ArrowRight" || k === "ArrowUp" || k === "ArrowDown"
+          || k === "Home" || k === "End"
+          || k === "PageUp" || k === "PageDown"
+          || k === "Tab"
+          || k === "Enter"
+        ) {
+          this.delegatedInsertReplayPossible = false;
+        }
+      }
       if (
         !insertMode
         && (e.key === "Backspace" || e.key === "Delete" || e.key === "Escape")
@@ -2024,6 +2313,9 @@ export class MonacoNeovimClient {
         // Preempt Monaco edits/selection handling and forward to Neovim.
         stopAll(e);
         try { e.preventDefault(); } catch (_) {}
+        // While we're already in the middle of exiting delegated insert mode, an
+        // additional physical <Esc> shouldn't enqueue another <Esc>.
+        if (this.exitingInsertMode && key === "<Esc>") return;
         if (this.exitingInsertMode) {
           this.pendingKeysAfterExit += key;
         } else {
@@ -2075,13 +2367,19 @@ export class MonacoNeovimClient {
         this.debugLog(`keydown(capture) buffer: key=${JSON.stringify(e.key)} code=${JSON.stringify(e.code)} mods=${e.ctrlKey ? "C" : ""}${e.altKey ? "A" : ""}${e.metaKey ? "D" : ""}${e.shiftKey ? "S" : ""} -> ${key}`);
         this.pendingKeysAfterExit += key;
       } else {
-        if (insertMode) this.flushPendingMonacoSync();
-        this.debugLog(`keydown(capture) send: key=${JSON.stringify(e.key)} code=${JSON.stringify(e.code)} mods=${e.ctrlKey ? "C" : ""}${e.altKey ? "A" : ""}${e.metaKey ? "D" : ""}${e.shiftKey ? "S" : ""} -> ${key}`);
-        this.sendInput(key);
+        if (insertMode && (key === "<C-[>" || key === "<C-c>")) {
+          this.debugLog(`keydown(capture) exit insert: key=${JSON.stringify(e.key)} code=${JSON.stringify(e.code)} mods=${e.ctrlKey ? "C" : ""}${e.altKey ? "A" : ""}${e.metaKey ? "D" : ""}${e.shiftKey ? "S" : ""} -> ${key}`);
+          this.exitDelegatedInsertMode(key);
+        } else {
+          if (insertMode) this.flushPendingMonacoSync();
+          this.debugLog(`keydown(capture) send: key=${JSON.stringify(e.key)} code=${JSON.stringify(e.code)} mods=${e.ctrlKey ? "C" : ""}${e.altKey ? "A" : ""}${e.metaKey ? "D" : ""}${e.shiftKey ? "S" : ""} -> ${key}`);
+          this.sendInput(key);
+        }
       }
     };
 
-    const onCompositionStart = () => {
+    const onCompositionStart = (e: CompositionEvent) => {
+      if (!isEditorEvent(e)) return;
       this.compositionActive = true;
       this.debugLog(`compositionstart delegateInsert=${this.delegateInsertToMonaco} mode=${JSON.stringify(this.lastMode)}`);
       if (this.delegateInsertToMonaco) {
@@ -2091,20 +2389,27 @@ export class MonacoNeovimClient {
       this.setPreedit("");
     };
     const onCompositionEnd = (e: CompositionEvent) => {
+      if (!isEditorEvent(e)) return;
       this.compositionActive = false;
       this.setPreedit(null);
       this.debugLog(`compositionend delegateInsert=${this.delegateInsertToMonaco} mode=${JSON.stringify(this.lastMode)} data=${JSON.stringify((e as any).data ?? "")}`);
       if (this.delegateInsertToMonaco) {
-        this.scheduleCursorSyncToNvim();
+        if (this.pendingEscAfterComposition) {
+          this.pendingEscAfterComposition = false;
+          this.exitDelegatedInsertMode("<Esc>");
+          return;
+        }
+        // Avoid late cursor syncs when we are in the middle of exiting insert mode.
+        if (!this.exitingInsertMode) this.scheduleCursorSyncToNvim();
         return;
       }
-      const target = asInputTarget(e.target);
+      const target = asMaybeInputTarget(e.target);
       if (isCmdlineLike(this.lastMode)) {
         // Command-line/search mode relies on IME/text input events, not keydown.
         const data = typeof e.data === "string" ? e.data : "";
         const fallback = (!data && target && (target as any).tagName === "TEXTAREA" && (target as HTMLTextAreaElement).value)
           ? String((target as HTMLTextAreaElement).value)
-          : (!data && target?.textContent ? String(target.textContent) : "");
+        : (!data && target?.textContent ? String(target.textContent) : "");
         const commit = data || fallback;
         if (commit) this.sendCmdlineImeText(commit);
       }
@@ -2118,9 +2423,10 @@ export class MonacoNeovimClient {
       }
     };
     const onCompositionUpdate = (e: CompositionEvent) => {
+      if (!isEditorEvent(e)) return;
       if (!this.compositionActive) this.compositionActive = true;
       if (this.delegateInsertToMonaco) return;
-      const target = asInputTarget(e.target);
+      const target = asMaybeInputTarget(e.target);
       const data = typeof e.data === "string" ? e.data : (
         (target && (target as any).tagName === "TEXTAREA" && (target as HTMLTextAreaElement).value)
           ? String((target as HTMLTextAreaElement).value)
@@ -2129,9 +2435,9 @@ export class MonacoNeovimClient {
       this.setPreedit(data || "");
     };
     const onBeforeInput = (e: Event) => {
-      const target = asInputTarget(e.target);
-      if (!target) return;
+      if (!isEditorEvent(e)) return;
       if (this.delegateInsertToMonaco && !this.exitingInsertMode) return;
+      const target = asMaybeInputTarget(e.target);
       // Prevent Monaco from turning IME/text input events into model edits; Neovim
       // remains the source of truth and we re-render from nvim_buf_lines_event.
       stopAll(e);
@@ -2150,17 +2456,17 @@ export class MonacoNeovimClient {
       }
     };
     const onInput = (e: Event) => {
-      const target = asInputTarget((e as InputEvent).target);
-      if (!target) return;
+      if (!isEditorEvent(e)) return;
       if (this.delegateInsertToMonaco && !this.exitingInsertMode) return;
+      const target = asMaybeInputTarget((e as InputEvent).target);
       stopAll(e);
       const ie = e as InputEvent;
 
       if (this.ignoreNextInputEvent) {
         this.ignoreNextInputEvent = false;
         try {
-          if ((target as any).tagName === "TEXTAREA") (target as HTMLTextAreaElement).value = "";
-          else target.textContent = "";
+          if ((target as any)?.tagName === "TEXTAREA") (target as HTMLTextAreaElement).value = "";
+          else if (target) target.textContent = "";
         } catch (_) {}
         return;
       }
@@ -2168,21 +2474,21 @@ export class MonacoNeovimClient {
 
       if (isCmdlineLike(this.lastMode)) {
         const data = typeof ie.data === "string" ? ie.data : "";
-        const fallback = (!data && (target as any).tagName === "TEXTAREA" && (target as HTMLTextAreaElement).value)
+        const fallback = (!data && (target as any)?.tagName === "TEXTAREA" && (target as HTMLTextAreaElement).value)
           ? String((target as HTMLTextAreaElement).value)
           : (!data && target?.textContent ? String(target.textContent) : "");
         const commit = data || fallback;
         if (commit) this.sendCmdlineImeText(commit);
       }
       try {
-        if ((target as any).tagName === "TEXTAREA") (target as HTMLTextAreaElement).value = "";
-        else target.textContent = "";
+        if ((target as any)?.tagName === "TEXTAREA") (target as HTMLTextAreaElement).value = "";
+        else if (target) target.textContent = "";
       } catch (_) {}
     };
     const onPaste = (e: ClipboardEvent) => {
-      const target = asInputTarget(e.target);
-      if (!target) return;
+      if (!isEditorEvent(e)) return;
       if (this.delegateInsertToMonaco && !this.exitingInsertMode) return;
+      const target = asMaybeInputTarget(e.target);
       stopAll(e);
       const text = e.clipboardData?.getData("text/plain") ?? "";
       if (text) {
@@ -2191,20 +2497,20 @@ export class MonacoNeovimClient {
         this.pasteText(text);
       }
       try {
-        if ((target as any).tagName === "TEXTAREA") (target as HTMLTextAreaElement).value = "";
-        else target.textContent = "";
+        if ((target as any)?.tagName === "TEXTAREA") (target as HTMLTextAreaElement).value = "";
+        else if (target) target.textContent = "";
       } catch (_) {}
     };
 
     this.disposables.push(
       // Capture phase to ensure we see events even if Monaco stops propagation.
-      domListener(root, "keydown", onKeydownCapture, true),
-      domListener(root, "beforeinput", onBeforeInput, true),
-      domListener(root, "input", onInput, true),
-      domListener(root, "paste", onPaste, true),
-      domListener(root, "compositionstart", onCompositionStart, true),
-      domListener(root, "compositionupdate", onCompositionUpdate, true),
-      domListener(root, "compositionend", onCompositionEnd, true),
+      domListener(view, "keydown", onKeydownCapture, true),
+      domListener(view, "beforeinput", onBeforeInput, true),
+      domListener(view, "input", onInput, true),
+      domListener(view, "paste", onPaste, true),
+      domListener(view, "compositionstart", onCompositionStart, true),
+      domListener(view, "compositionupdate", onCompositionUpdate, true),
+      domListener(view, "compositionend", onCompositionEnd, true),
     );
   }
 
@@ -2248,19 +2554,25 @@ export class MonacoNeovimClient {
   }
 
   private ensureVisualStyle(): void {
-    if (this.visualStyleEl) return;
-    const el = document.createElement("style");
-    el.id = "monaco-neovim-wasm-visual-style";
-    el.textContent = `
+    if (!this.visualStyleEl) {
+      const el = document.createElement("style");
+      el.id = "monaco-neovim-wasm-visual-style";
+      el.textContent = `
 .monaco-neovim-visual-line {
   background-color: ${this.visualBgCss};
 }
 .monaco-neovim-visual-inline {
   background-color: ${this.visualBgCss};
 }
+.monaco-neovim-visual-virtual {
+  position: absolute;
+  background-color: ${this.visualBgCss};
+  pointer-events: none;
+}
 `;
-    document.head.appendChild(el);
-    this.visualStyleEl = el;
+      document.head.appendChild(el);
+      this.visualStyleEl = el;
+    }
   }
 
   private setVisualBgCss(bg: string): void {
@@ -2275,12 +2587,120 @@ export class MonacoNeovimClient {
 .monaco-neovim-visual-inline {
   background-color: ${this.visualBgCss};
 }
+.monaco-neovim-visual-virtual {
+  position: absolute;
+  background-color: ${this.visualBgCss};
+  pointer-events: none;
+}
 `;
     }
   }
 
+  private ensureVisualVirtualOverlay(): HTMLDivElement | null {
+    if (this.visualVirtualOverlayEl && this.visualVirtualOverlayEl.isConnected) return this.visualVirtualOverlayEl;
+    const root = this.editor.getDomNode();
+    if (!root) return null;
+    const host =
+      (root.querySelector(".lines-content .view-overlays") as HTMLElement | null)
+      ?? (root.querySelector(".view-overlays") as HTMLElement | null)
+      ?? root;
+    const el = document.createElement("div");
+    el.id = "monaco-neovim-wasm-visual-virtual-overlay";
+    el.style.position = "absolute";
+    el.style.left = "0";
+    el.style.top = "0";
+    el.style.width = "100%";
+    el.style.height = "100%";
+    el.style.pointerEvents = "none";
+    // Attach under Monaco's overlay layer so the highlight doesn't visually
+    // "wash out" foreground text (closer to VS Code / Monaco selection).
+    host.appendChild(el);
+    this.visualVirtualOverlayEl = el;
+    return el;
+  }
+
+  private clearVisualVirtualOverlay(): void {
+    this.visualVirtualActive = false;
+    this.visualVirtualRawRanges = [];
+    if (this.visualVirtualOverlayEl) {
+      try { this.visualVirtualOverlayEl.replaceChildren(); } catch (_) {}
+    }
+  }
+
+  private renderVisualVirtualOverlay(): void {
+    if (!this.visualVirtualActive) return;
+    const overlay = this.ensureVisualVirtualOverlay();
+    if (!overlay) return;
+    const model = this.editor.getModel();
+    if (!model) {
+      try { overlay.replaceChildren(); } catch (_) {}
+      return;
+    }
+    const root = this.editor.getDomNode();
+    let offsetX = 0;
+    let offsetY = 0;
+    if (root && overlay !== root) {
+      try {
+        const rootRect = root.getBoundingClientRect();
+        const overlayRect = overlay.getBoundingClientRect();
+        offsetX = Number.isFinite(overlayRect.left - rootRect.left) ? (overlayRect.left - rootRect.left) : 0;
+        offsetY = Number.isFinite(overlayRect.top - rootRect.top) ? (overlayRect.top - rootRect.top) : 0;
+      } catch (_) {
+      }
+    }
+    const rawRanges = Array.isArray(this.visualVirtualRawRanges) ? this.visualVirtualRawRanges : [];
+    if (rawRanges.length === 0) {
+      try { overlay.replaceChildren(); } catch (_) {}
+      return;
+    }
+
+    const fontInfo = this.editor.getOption(monaco.editor.EditorOption.fontInfo) as any;
+    const charWidth = Math.max(1, Number(fontInfo?.typicalHalfwidthCharacterWidth ?? fontInfo?.maxDigitWidth ?? 0) || 0);
+
+    const frag = document.createDocumentFragment();
+    for (const r of rawRanges) {
+      const l0 = Number(r?.start?.line);
+      const startVcol = Number(r?.start_vcol);
+      const endVcol = Number(r?.end_vcol);
+      const disp = Number(r?.disp);
+      if (!Number.isFinite(l0)
+        || !Number.isFinite(startVcol)
+        || !Number.isFinite(endVcol)
+        || !Number.isFinite(disp)) continue;
+      const lineNumber = l0 + 1;
+      if (lineNumber < 1 || lineNumber > model.getLineCount()) continue;
+
+      const leftVcol = Math.min(startVcol, endVcol);
+      const rightVcol = Math.max(startVcol, endVcol);
+
+      const visCol1 = this.editor.getScrolledVisiblePosition(new monaco.Position(lineNumber, 1));
+      if (!visCol1) continue;
+
+      const widthCols = rightVcol - leftVcol + 1;
+      if (widthCols <= 0) continue;
+      const xStart = visCol1.left + Math.max(0, leftVcol - 1) * charWidth;
+      const w = widthCols * charWidth;
+      if (!Number.isFinite(w) || w <= 0) continue;
+
+      const el = document.createElement("div");
+      el.className = "monaco-neovim-visual-virtual";
+      // If the overlay container isn't the editor root (e.g. attached under
+      // Monaco's `.view-overlays`), adjust for its coordinate origin.
+      el.style.left = `${Math.max(0, xStart - offsetX)}px`;
+      el.style.top = `${Math.max(0, visCol1.top - offsetY)}px`;
+      el.style.width = `${w}px`;
+      el.style.height = `${Math.max(0, visCol1.height)}px`;
+      frag.appendChild(el);
+    }
+    try { overlay.replaceChildren(frag); } catch (_) {}
+  }
+
   private clearVisualDecorations(): void {
-    if (!this.visualDecorationIds.length) return;
+    this.clearVisualVirtualOverlay();
+    if (!this.visualDecorationIds.length) {
+      this.visualSelectionActive = false;
+      return;
+    }
     try {
       this.visualDecorationIds = this.editor.deltaDecorations(this.visualDecorationIds, []);
     } catch (_) {
@@ -2411,10 +2831,16 @@ export class MonacoNeovimClient {
     }
   }
 
-  private applyVisualDecorations(selections: monaco.Selection[], mode: string): void {
+  private applyVisualDecorations(
+    selections: monaco.Selection[],
+    mode: string,
+    rawRanges: any[] = [],
+    modeTailOverride = "",
+  ): void {
     this.ensureVisualStyle();
-    const tail = getModeTail(mode);
+    const tail = (typeof modeTailOverride === "string" && modeTailOverride) ? modeTailOverride : getModeTail(mode);
     const isLinewise = tail === "V";
+    const isBlockwise = tail === "\u0016";
     const decorations: monaco.editor.IModelDeltaDecoration[] = [];
     if (isLinewise) {
       let minLine = Infinity;
@@ -2431,22 +2857,49 @@ export class MonacoNeovimClient {
           options: { isWholeLine: true, className: "monaco-neovim-visual-line" },
         });
       }
-    } else {
+    } else if (!isBlockwise) {
       for (const sel of selections) {
         const a = sel.getStartPosition();
         const b = sel.getEndPosition();
         decorations.push({
           range: monaco.Range.fromPositions(a, b),
-          options: { inlineClassName: "monaco-neovim-visual-inline" },
+          options: { className: "monaco-neovim-visual-inline" },
         });
       }
     }
+
+    if (isBlockwise) {
+      this.visualVirtualRawRanges = Array.isArray(rawRanges) ? rawRanges : [];
+      this.visualVirtualActive = true;
+      this.renderVisualVirtualOverlay();
+    } else {
+      this.clearVisualVirtualOverlay();
+    }
     try {
       this.visualDecorationIds = this.editor.deltaDecorations(this.visualDecorationIds, decorations);
-      this.visualSelectionActive = decorations.length > 0;
+      this.visualSelectionActive = decorations.length > 0 || isBlockwise;
     } catch (_) {
       this.visualDecorationIds = [];
       this.visualSelectionActive = false;
+    }
+
+    // Keep Monaco's own selection collapsed so it doesn't visually compete with
+    // Neovim's visual-mode highlights (especially in visual-block mode where we
+    // use a DOM overlay instead of model decorations).
+    if (this.visualSelectionActive && !this.compositionActive) {
+      // Only collapse using Monaco's *current* cursor position. Using a cached
+      // lastCursorPos here can jump the cursor when entering visual mode (mode
+      // events can arrive before cursor events).
+      const pos = this.editor.getPosition();
+      if (pos) {
+        try {
+          this.suppressCursorSync = true;
+          this.editor.setSelection(new monaco.Selection(pos.lineNumber, pos.column, pos.lineNumber, pos.column));
+        } catch (_) {
+        } finally {
+          this.suppressCursorSync = false;
+        }
+      }
     }
   }
 
@@ -2456,15 +2909,38 @@ export class MonacoNeovimClient {
     const prevMode = this.lastMode;
     this.lastMode = m;
     if (isCmdlineLike(m)) this.ignoreNextInputEvent = false;
+    this.setMonacoHighlightsSuppressed(isVisualMode(m));
 
     const nextDelegate = isInsertLike(m) && !this.recordingRegister;
     if (nextDelegate !== this.delegateInsertToMonaco) {
       this.delegateInsertToMonaco = nextDelegate;
+      this.setEditorReadOnly(!nextDelegate);
       const state = this.ensureActiveState();
       if (nextDelegate) {
         this.setPreedit(null);
         this.dotRepeatKeys = "";
         this.dotRepeatBackspaces = 0;
+        this.delegatedInsertReplayPossible = true;
+        {
+          const raw = this.recentNormalKeys;
+          const last1 = raw.slice(-1);
+          const last2 = raw.slice(-2);
+          const single = new Set(["i", "a", "I", "A", "o", "O", "s", "S", "C", "R"]);
+          if (last2 === "cc") {
+            this.lastDelegatedInsertPrefix = "cc";
+          } else if (single.has(last1)) {
+            this.lastDelegatedInsertPrefix = last1;
+          } else {
+            const idx = raw.lastIndexOf("c");
+            if (idx >= 0) {
+              let start = idx;
+              while (start > 0 && /\d/.test(raw[start - 1] ?? "")) start -= 1;
+              this.lastDelegatedInsertPrefix = raw.slice(start);
+            } else {
+              this.lastDelegatedInsertPrefix = null;
+            }
+          }
+        }
         if (state) {
           state.shadowLines = this.editor.getModel()?.getLinesContent() ?? null;
           state.pendingBufEdits = [];
@@ -2483,6 +2959,7 @@ export class MonacoNeovimClient {
         }
         this.dotRepeatKeys = "";
         this.dotRepeatBackspaces = 0;
+        this.delegatedInsertReplayPossible = false;
       }
     }
 
@@ -2517,22 +2994,150 @@ export class MonacoNeovimClient {
     this.scheduleSearchHighlightRefresh();
   }
 
+  private setEditorReadOnly(readOnly: boolean): void {
+    const next = Boolean(readOnly);
+    if (this.editorReadOnly === next) return;
+    try {
+      this.editor.updateOptions({ readOnly: next });
+      this.editorReadOnly = next;
+    } catch (_) {
+    }
+  }
+
   private armInsertExit(): void {
     this.exitingInsertMode = true;
+    // When exiting delegated insert, Monaco can emit follow-up cursor updates
+    // (source="api") due to option toggles/selection normalization. Don't sync
+    // those back to Neovim, otherwise they can override Neovim's final cursor
+    // position after <Esc>.
+    this.ignoreMonacoCursorSyncToNvimUntil = this.nowMs() + 250;
     this.pendingKeysAfterExit = "";
     if (this.exitInsertTimer) {
       clearTimeout(this.exitInsertTimer);
       this.exitInsertTimer = null;
     }
+    // Stop any debounced Monaco->Neovim sync from firing after we've initiated
+    // insert-mode exit; late cursor syncs can override Neovim's final cursor
+    // position after <Esc>.
+    if (this.cursorSyncTimer) {
+      clearTimeout(this.cursorSyncTimer);
+      this.cursorSyncTimer = null;
+    }
     // Fallback: if we don't observe a mode change soon, don't keep buffering forever.
     this.exitInsertTimer = window.setTimeout(() => {
       this.exitInsertTimer = null;
       if (!this.exitingInsertMode) return;
-      this.exitingInsertMode = false;
       const pending = this.pendingKeysAfterExit;
       this.pendingKeysAfterExit = "";
       if (pending) this.sendInput(pending);
-    }, 200);
+    }, 800);
+  }
+
+  private finalizeDelegatedInsertDotRepeat(): void {
+    const prefix = this.lastDelegatedInsertPrefix;
+    const keys = this.dotRepeatKeys;
+    if (this.delegatedInsertReplayPossible && prefix && keys) {
+      this.lastDelegatedDotRepeat = { prefix, keys };
+    } else {
+      this.lastDelegatedDotRepeat = null;
+    }
+    this.dotRepeatKeys = "";
+    this.dotRepeatBackspaces = 0;
+    this.delegatedInsertReplayPossible = false;
+  }
+
+  private exitDelegatedInsertMode(exitKey: string): void {
+    this.debugLog(`exitDelegatedInsertMode: key=${JSON.stringify(exitKey)} prefix=${JSON.stringify(this.lastDelegatedInsertPrefix)} dotKeysLen=${this.dotRepeatKeys.length} replayPossible=${this.delegatedInsertReplayPossible}`);
+    this.finalizeDelegatedInsertDotRepeat();
+    // Begin buffering keys immediately, then perform a blocking flush/cursor-sync
+    // before sending <Esc>, matching vscode-neovim's sequencing.
+    this.armInsertExit();
+    void this.performDelegatedInsertExit(exitKey);
+  }
+
+  private async performDelegatedInsertExit(exitKey: string): Promise<void> {
+    if (!this.session || !this.session.isRunning()) return;
+    if (!this.bufHandle) return;
+
+    try {
+      this.debugLog(`performDelegatedInsertExit: begin buf=${this.bufHandle} exitKey=${JSON.stringify(exitKey)}`);
+    } catch (_) {
+    }
+
+    try {
+      await this.flushPendingMonacoSyncBlocking();
+    } catch (_) {
+    }
+
+    try {
+      const model = this.editor.getModel();
+      const pos = this.editor.getPosition();
+      if (model && pos) {
+        const text = model.getLineContent(pos.lineNumber) ?? "";
+        const byteCol0 = charIndexToByteIndex(text, Math.max(0, pos.column - 1));
+        this.ignoreInsertExitCursor = { line: pos.lineNumber, col0: byteCol0, untilMs: this.nowMs() + 400 };
+        this.debugLog(`exitDelegatedInsertMode: sync cursor before exit: line=${pos.lineNumber} col=${pos.column} (byteCol0=${byteCol0})`);
+        await this.rpcCall("nvim_win_set_cursor", [0, [pos.lineNumber, byteCol0]]);
+      }
+    } catch (_) {
+    }
+
+    try {
+      await this.rpcCall("nvim_input", [exitKey]);
+    } catch (_) {
+      this.sendInput(exitKey);
+    }
+
+    try {
+      this.debugLog(`performDelegatedInsertExit: sent exitKey=${JSON.stringify(exitKey)}`);
+    } catch (_) {
+    }
+  }
+
+  private async flushPendingMonacoSyncBlocking(): Promise<void> {
+    if (!this.session || !this.session.isRunning()) return;
+    if (!this.bufHandle) return;
+    const state = this.getActiveState();
+    if (!state) return;
+    const model = this.editor.getModel();
+    if (!model) return;
+    if (state.model !== model) return;
+
+    try {
+      this.debugLog(`flushPendingMonacoSyncBlocking: full=${state.pendingFullSync} edits=${state.pendingBufEdits.length} cursor=${state.pendingCursorSync} buf=${this.bufHandle}`);
+    } catch (_) {
+    }
+
+    // Match flushPendingMonacoSync's preference for full sync when multiple edits exist.
+    if (!state.pendingFullSync && state.pendingBufEdits.length > 1) {
+      state.pendingFullSync = true;
+    }
+
+    if (state.pendingFullSync) {
+      const lines = model.getLinesContent();
+      state.pendingFullSync = false;
+      state.pendingBufEdits = [];
+      state.pendingCursorSync = false;
+      state.shadowLines = lines.slice();
+      if (this.delegateInsertToMonaco) this.ignoreActiveBufLinesEventsUntil = this.nowMs() + 120;
+      await this.rpcCall("nvim_buf_set_lines", [this.bufHandle, 0, -1, false, lines]);
+      return;
+    }
+
+    if (state.pendingBufEdits.length) {
+      const edits = state.pendingBufEdits.slice();
+      state.pendingBufEdits = [];
+      state.pendingCursorSync = false;
+      if (this.delegateInsertToMonaco) this.ignoreActiveBufLinesEventsUntil = this.nowMs() + 120;
+      for (const edit of edits) {
+        await this.rpcCall("nvim_buf_set_text", [this.bufHandle, edit.startRow, edit.startColByte, edit.endRow, edit.endColByte, edit.lines]);
+      }
+      return;
+    }
+
+    if (state.pendingCursorSync) {
+      state.pendingCursorSync = false;
+    }
   }
 
   private syncDotRepeatToNvim(): void {
@@ -2601,11 +3206,14 @@ vim.opt.ei = ei
       // While delegating insert-mode typing to Monaco (IME-friendly), only
       // forward "command-like" keys to Neovim after syncing Monaco -> Neovim.
       if (browserEvent.key === "Escape") {
+        if (this.compositionActive || browserEvent.isComposing) {
+          // Let the browser/Monaco finish the IME composition first, then send
+          // <Esc> to Neovim from `compositionend`.
+          this.pendingEscAfterComposition = true;
+          return;
+        }
         ev.preventDefault();
-        this.armInsertExit();
-        this.flushPendingMonacoSync();
-        this.syncDotRepeatToNvim();
-        this.sendInput("<Esc>");
+        this.exitDelegatedInsertMode("<Esc>");
         return;
       }
       if (!this.opts.shouldHandleKey(browserEvent)) return;
@@ -2616,8 +3224,12 @@ vim.opt.ei = ei
         const key = this.opts.translateKey(browserEvent);
         if (!key) return;
         ev.preventDefault();
-        this.flushPendingMonacoSync();
-        this.sendInput(key);
+        if (key === "<C-[>" || key === "<C-c>") {
+          this.exitDelegatedInsertMode(key);
+        } else {
+          this.flushPendingMonacoSync();
+          this.sendInput(key);
+        }
         return;
       }
       return;
@@ -2677,6 +3289,23 @@ vim.opt.ei = ei
         this.recordingRegister = key;
         this.scheduleRecordingRefresh();
       }
+
+      if (key === "." && this.lastDelegatedDotRepeat) {
+        const { prefix, keys: replay } = this.lastDelegatedDotRepeat;
+        this.sendInput(prefix);
+        this.sendInput(replay);
+        this.sendInput("<Esc>");
+        return;
+      }
+
+      if (this.lastDelegatedDotRepeat) {
+        const clearOn = new Set(["c", "d", "y", "p", "x", "s", "r", "~", "J", ":"]);
+        if (clearOn.has(key)) this.lastDelegatedDotRepeat = null;
+      }
+
+    }
+    if (!isInsertLike(this.lastMode) && key.length === 1 && !key.startsWith("<")) {
+      this.recentNormalKeys = (this.recentNormalKeys + key).slice(-16);
     }
     this.sendInput(key);
   }
@@ -2839,6 +3468,9 @@ api.nvim_win_set_cursor(0, { b_line, b_col0 })
       state.pendingFullSync = true;
       state.pendingCursorSync = true;
       state.shadowLines = model.getLinesContent();
+      this.dotRepeatKeys = "";
+      this.dotRepeatBackspaces = 0;
+      this.delegatedInsertReplayPossible = false;
       this.scheduleFlushPendingMonacoSync();
       return;
     }
@@ -2847,6 +3479,9 @@ api.nvim_win_set_cursor(0, { b_line, b_col0 })
       state.pendingFullSync = true;
       state.pendingCursorSync = true;
       state.shadowLines = model.getLinesContent();
+      this.dotRepeatKeys = "";
+      this.dotRepeatBackspaces = 0;
+      this.delegatedInsertReplayPossible = false;
       this.scheduleFlushPendingMonacoSync();
       return;
     }
@@ -2860,6 +3495,9 @@ api.nvim_win_set_cursor(0, { b_line, b_col0 })
       state.pendingFullSync = true;
       state.pendingCursorSync = true;
       state.shadowLines = model.getLinesContent();
+      this.dotRepeatKeys = "";
+      this.dotRepeatBackspaces = 0;
+      this.delegatedInsertReplayPossible = false;
       this.scheduleFlushPendingMonacoSync();
       return;
     }
@@ -2888,10 +3526,12 @@ api.nvim_win_set_cursor(0, { b_line, b_col0 })
         if (this.dotRepeatKeys.length > 20000) {
           this.dotRepeatKeys = "";
           this.dotRepeatBackspaces = 0;
+          this.delegatedInsertReplayPossible = false;
         }
       } else {
         this.dotRepeatKeys = "";
         this.dotRepeatBackspaces = 0;
+        this.delegatedInsertReplayPossible = false;
       }
     } catch (_) {
     }
@@ -2905,6 +3545,7 @@ api.nvim_win_set_cursor(0, { b_line, b_col0 })
 
   private scheduleCursorSyncToNvim(): void {
     if (!this.delegateInsertToMonaco) return;
+    if (this.exitingInsertMode) return;
     const state = this.getActiveState();
     if (!state) return;
     state.pendingCursorSync = true;
@@ -2929,6 +3570,8 @@ api.nvim_win_set_cursor(0, { b_line, b_col0 })
     if (!model) return;
     if (state.model !== model) return;
 
+    this.debugLog(`flushPendingMonacoSync: full=${state.pendingFullSync} edits=${state.pendingBufEdits.length} cursor=${state.pendingCursorSync} delegateInsert=${this.delegateInsertToMonaco} exitingInsert=${this.exitingInsertMode} mode=${JSON.stringify(this.lastMode)}`);
+
     // Prefer a single full sync when there are multiple incremental edits; it
     // reduces undo fragmentation and avoids tricky coordinate rebasing.
     if (!state.pendingFullSync && state.pendingBufEdits.length > 1) {
@@ -2938,6 +3581,7 @@ api.nvim_win_set_cursor(0, { b_line, b_col0 })
     if (state.pendingFullSync) {
       const lines = model.getLinesContent();
       this.sendNotify("nvim_buf_set_lines", [this.bufHandle, 0, -1, false, lines]);
+      if (this.delegateInsertToMonaco) this.ignoreActiveBufLinesEventsUntil = this.nowMs() + 120;
       state.pendingFullSync = false;
       state.pendingBufEdits = [];
       state.shadowLines = lines.slice();
@@ -2945,18 +3589,25 @@ api.nvim_win_set_cursor(0, { b_line, b_col0 })
       for (const edit of state.pendingBufEdits) {
         this.sendNotify("nvim_buf_set_text", [this.bufHandle, edit.startRow, edit.startColByte, edit.endRow, edit.endColByte, edit.lines]);
       }
+      if (this.delegateInsertToMonaco) this.ignoreActiveBufLinesEventsUntil = this.nowMs() + 120;
       state.pendingBufEdits = [];
     }
 
     if (state.pendingCursorSync) {
       state.pendingCursorSync = false;
-      this.syncCursorToNvimNow();
+      // Only sync the caret position while insert-mode typing is delegated to
+      // Monaco. After leaving insert mode, Neovim owns the caret and late syncs
+      // can cause cursor jumps.
+      if (this.delegateInsertToMonaco && !this.exitingInsertMode) {
+        this.syncCursorToNvimNow();
+      }
     }
   }
 
-  private syncCursorToNvimNow(): void {
+  private syncCursorToNvimNow(force = false): void {
     if (!this.session || !this.session.isRunning()) return;
     if (!this.bufHandle) return;
+    if (!force && !this.delegateInsertToMonaco) return;
     const model = this.editor.getModel();
     const pos = this.editor.getPosition();
     if (!model || !pos) return;
@@ -3312,6 +3963,7 @@ vim.rpcnotify(chan, "monaco_buf_enter", {
     const validated = model
       ? model.validatePosition(new monaco.Position(ln, cl))
       : new monaco.Position(ln, cl);
+    this.debugLog(`updateCursor: line=${validated.lineNumber} col=${validated.column} (from line=${ln} col=${cl}) visual=${this.visualSelectionActive} mode=${JSON.stringify(this.lastMode)}`);
     this.lastCursorPos = validated;
     if (this.compositionActive) return;
     const current = this.editor.getPosition();
@@ -3426,21 +4078,29 @@ vim.rpcnotify(chan, "monaco_buf_enter", {
       return;
     }
     try {
-      const selections = await this.fetchVisualRanges();
+      const { selections, raw, tail } = await this.fetchVisualRanges();
       if (token !== this.visualSelectionToken) return;
       if (!selections.length) return;
-      this.applyVisualDecorations(selections, mode);
+      this.applyVisualDecorations(selections, mode, raw, tail);
     } catch (_) {
     }
   }
 
-  private async fetchVisualRanges(): Promise<monaco.Selection[]> {
+  private async fetchVisualRanges(): Promise<{ selections: monaco.Selection[]; raw: any[]; tail: string }> {
     const res = await this.execLua(VISUAL_SELECTION_LUA, []);
-    if (!Array.isArray(res)) return [];
-    const selections = (res as any[])
+    let raw: any[] = [];
+    let tail = "";
+    if (Array.isArray(res)) {
+      raw = res as any[];
+    } else if (res && typeof res === "object") {
+      const obj = res as any;
+      tail = typeof obj.tail === "string" ? obj.tail : "";
+      raw = Array.isArray(obj.ranges) ? obj.ranges : [];
+    }
+    const selections = raw
       .map(byteRangeToSelection(this.editor))
       .filter((s): s is monaco.Selection => Boolean(s));
-    return selections;
+    return { selections, raw, tail };
   }
 
   private async syncVisualSelectionColor(): Promise<void> {
@@ -3462,6 +4122,42 @@ vim.rpcnotify(chan, "monaco_buf_enter", {
       this.setVisualBgCss(main);
     } catch (_) {
     }
+  }
+
+  private setMonacoHighlightsSuppressed(suppress: boolean): void {
+    const EditorOption = monaco.editor.EditorOption;
+    const next = Boolean(suppress);
+    if (next === this.monacoHighlightsSuppressed) return;
+    if (next) {
+      try {
+        this.monacoPrevOccurrencesHighlight = this.editor.getOption(EditorOption.occurrencesHighlight) as any;
+        this.monacoPrevSelectionHighlight = this.editor.getOption(EditorOption.selectionHighlight) as any;
+        this.monacoPrevSelectionHighlightMultiline = this.editor.getOption(EditorOption.selectionHighlightMultiline) as any;
+      } catch (_) {
+      }
+      try {
+        this.editor.updateOptions({
+          occurrencesHighlight: "off" as any,
+          selectionHighlight: false,
+          selectionHighlightMultiline: false,
+        } as any);
+        this.monacoHighlightsSuppressed = true;
+      } catch (_) {
+      }
+      return;
+    }
+    try {
+      this.editor.updateOptions({
+        occurrencesHighlight: (this.monacoPrevOccurrencesHighlight ?? "singleFile") as any,
+        selectionHighlight: this.monacoPrevSelectionHighlight ?? true,
+        selectionHighlightMultiline: this.monacoPrevSelectionHighlightMultiline ?? true,
+      } as any);
+    } catch (_) {
+    }
+    this.monacoHighlightsSuppressed = false;
+    this.monacoPrevOccurrencesHighlight = null;
+    this.monacoPrevSelectionHighlight = null;
+    this.monacoPrevSelectionHighlightMultiline = null;
   }
 
   private async fetchVisualBg(): Promise<string | null> {
@@ -3670,6 +4366,9 @@ function byteIndexToCharIndex(text: string, byteIndex: number): number {
     }
     const code = text.codePointAt(charIndex);
     const bytes = utf8ByteLength(code ?? 0);
+    // If the requested byte offset falls in the middle of a multibyte
+    // character, clamp to the *start* of that character.
+    if (totalBytes + bytes > target) return charIndex;
     totalBytes += bytes;
     charIndex += bytes === 4 ? 2 : 1;
   }
@@ -3805,7 +4504,10 @@ function domListener<E extends Event>(
 
 function isInsertLike(mode: string): boolean {
   const m = typeof mode === "string" ? mode : "";
-  return m.startsWith("i") || m.startsWith("R");
+  // Treat only insert-family modes as "insert-like" for Monaco delegation.
+  // Replace mode (`R`) must be handled by Neovim directly; delegating it to
+  // Monaco breaks `r{char}` and `R` semantics (replace vs insert).
+  return m.startsWith("i");
 }
 
 function getModeTail(mode: string): string {
