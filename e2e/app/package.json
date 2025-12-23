@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@monaco-neovim-wasm/wasm-async": "0.1.12",
+    "@monaco-neovim-wasm/wasm-async": "0.1.13",
     "monaco-editor": "^0.55.1"
   }
 }
