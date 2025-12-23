@@ -187,6 +187,33 @@ const DEFAULT_SEED = [
   "print(greet('monaco'))",
 ];
 
+function tryLegacyCopy(text: string): boolean {
+  try {
+    if (typeof document === "undefined") return false;
+    const body = document.body;
+    if (!body) return false;
+    const el = document.createElement("textarea");
+    el.value = String(text ?? "");
+    el.setAttribute("readonly", "");
+    el.style.position = "fixed";
+    el.style.left = "0";
+    el.style.top = "0";
+    el.style.width = "1px";
+    el.style.height = "1px";
+    el.style.opacity = "0";
+    el.style.pointerEvents = "none";
+    body.appendChild(el);
+    el.focus();
+    el.select();
+    el.setSelectionRange(0, el.value.length);
+    const ok = Boolean((document as any).execCommand?.("copy"));
+    body.removeChild(el);
+    return ok;
+  } catch (_) {
+    return false;
+  }
+}
+
 const VISUAL_SELECTION_LUA = `
 	local api, fn = vim.api, vim.fn
 
@@ -635,7 +662,7 @@ export class MonacoNeovimClient {
         "set noswapfile signcolumn=no number norelativenumber",
         "set nowrap laststatus=0 cmdheight=1",
         "set shortmess+=F",
-        "set clipboard=unnamedplus",
+        ...(options.clipboard === null ? [] : ["set clipboard=unnamedplus"]),
       ],
       startupLua: options.startupLua ?? "",
       visualThemeName: options.visualThemeName ?? "nvim-visual",
@@ -1402,10 +1429,21 @@ export class MonacoNeovimClient {
     const adapter = this.opts.clipboard;
     if (adapter === null) return;
     if (adapter?.writeText) {
-      adapter.writeText(text).catch(() => {});
+      adapter.writeText(text)
+        .catch(() => {
+          if (navigator.clipboard?.writeText) {
+            navigator.clipboard.writeText(text).catch(() => { tryLegacyCopy(text); });
+          } else {
+            tryLegacyCopy(text);
+          }
+        });
       return;
     }
-    if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).catch(() => {});
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).catch(() => { tryLegacyCopy(text); });
+      return;
+    }
+    tryLegacyCopy(text);
   }
 
   private handleRequest(msgid: number, method: string, params: unknown[]): void {
@@ -3636,10 +3674,36 @@ api.nvim_win_set_cursor(0, { b_line, b_col0 })
       const scroll = this.opts.scrollMotions ? "true" : "false";
       const scrolloff = (this.opts.syncScrolloff && this.opts.scrolloff == null) ? "true" : "false";
       const hostCommands = this.opts.hostCommands ? "true" : "false";
+      const clipboard = this.opts.clipboard === null ? "false" : "true";
 const lua = `
 local chan = ...
 local api = vim.api
 vim.g.monaco_neovim_wasm_chan = chan
+
+local function setup_clipboard()
+  -- If user provided a clipboard provider (or explicitly disabled it), don't override.
+  if vim.g.clipboard ~= nil then return end
+  local function copy(lines, regtype)
+    vim.rpcnotify(chan, "wasm-clipboard-copy", lines, regtype)
+  end
+  local function paste()
+    local ok, res = pcall(vim.rpcrequest, chan, "wasm-clipboard-paste")
+    if not ok then return {}, "v" end
+    local lines = res and res[1] or {}
+    local regtype = res and res[2] or "v"
+    return lines, regtype
+  end
+  vim.g.clipboard = {
+    name = "wasm",
+    copy = { ["+"] = copy, ["*"] = copy },
+    paste = { ["+"] = paste, ["*"] = paste },
+    cache_enabled = 0,
+  }
+end
+
+if ${clipboard} then
+  pcall(setup_clipboard)
+end
 
 local function send_cursor()
   local cur = api.nvim_win_get_cursor(0)
@@ -3953,7 +4017,10 @@ vim.rpcnotify(chan, "monaco_buf_enter", {
     }
     navigator.clipboard.readText()
       .then((text) => fallback(text || ""))
-      .catch(() => fallback(""));
+      .catch(() => {
+        const manual = window.prompt("Paste text");
+        fallback(manual || "");
+      });
   }
 
   private updateCursor(lineNumber: number, column: number): void {

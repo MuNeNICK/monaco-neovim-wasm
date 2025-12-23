@@ -107,6 +107,12 @@ These features delegate some "screen line / viewport" behavior to Monaco for bet
 
 - `searchHighlights`: render Neovim search highlights as Monaco decorations (visible viewport)
 
+### Clipboard (yank / paste)
+
+- By default, yanks to `"+`/`"*` are bridged to the browser clipboard (Clipboard API), so they can be pasted into the OS.
+- If `navigator.clipboard` is unavailable, a best-effort legacy copy fallback is used.
+- You can override clipboard behavior via `clipboard: { readText, writeText }`, or disable it with `clipboard: null`.
+
 ### Host commands (`:e`, `:w`, `:q`)
 
 Enable "host-delegated" file commands:
