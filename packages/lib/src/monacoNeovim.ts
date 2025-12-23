@@ -532,6 +532,7 @@ export class MonacoNeovimClient {
   private recentNormalKeys = "";
   private lastDelegatedInsertPrefix: string | null = null;
   private lastDelegatedDotRepeat: { prefix: string; keys: string } | null = null;
+  private lastClipboardText: string | null = null;
   private ignoreInsertExitCursor: { line: number; col0: number; untilMs: number } | null = null;
   private ignoreMonacoCursorSyncToNvimUntil = 0;
   private ignoreTextKeydownUntil = 0;
@@ -1426,6 +1427,7 @@ export class MonacoNeovimClient {
 
   private handleClipboardCopy(lines: string[]): void {
     const text = (lines ?? []).join("\n");
+    this.lastClipboardText = text;
     const adapter = this.opts.clipboard;
     if (adapter === null) return;
     if (adapter?.writeText) {
@@ -3993,8 +3995,19 @@ vim.rpcnotify(chan, "monaco_buf_enter", {
 
   private doClipboardPaste(msgid: number): void {
     const fallback = (text: string | null | undefined) => {
+      this.lastClipboardText = text == null ? "" : String(text);
       const lines = (text || "").split(/\r?\n/);
       this.sendRpcResponse(msgid, null, [lines, "v"]);
+    };
+    const promptPaste = () => {
+      try {
+        // Avoid blocking modal dialogs during Playwright/WebDriver runs.
+        if (typeof navigator !== "undefined" && (navigator as any)?.webdriver) return null;
+        if (typeof window === "undefined" || typeof window.prompt !== "function") return null;
+        return window.prompt("Paste text");
+      } catch (_) {
+        return null;
+      }
     };
     const adapter = this.opts.clipboard;
     if (adapter === null) {
@@ -4005,21 +4018,21 @@ vim.rpcnotify(chan, "monaco_buf_enter", {
       adapter.readText()
         .then((text) => fallback(text || ""))
         .catch(() => {
-          const manual = window.prompt("Paste text");
-          fallback(manual || "");
+          const manual = promptPaste();
+          fallback(manual ?? this.lastClipboardText ?? "");
         });
       return;
     }
     if (!navigator.clipboard?.readText) {
-      const manual = window.prompt("Paste text");
-      fallback(manual || "");
+      const manual = promptPaste();
+      fallback(manual ?? this.lastClipboardText ?? "");
       return;
     }
     navigator.clipboard.readText()
       .then((text) => fallback(text || ""))
       .catch(() => {
-        const manual = window.prompt("Paste text");
-        fallback(manual || "");
+        const manual = promptPaste();
+        fallback(manual ?? this.lastClipboardText ?? "");
       });
   }
 
