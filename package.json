@@ -21,6 +21,6 @@
     "@playwright/test": "^1.57.0",
     "monaco-editor": "^0.55.1",
     "typescript": "^5.4.0",
-    "vite": "^5.2.0"
+    "vite": "^7.3.0"
   }
 }
