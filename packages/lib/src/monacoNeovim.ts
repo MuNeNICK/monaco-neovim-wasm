@@ -187,6 +187,8 @@ const DEFAULT_SEED = [
   "print(greet('monaco'))",
 ];
 
+const resolveDistUrl = (relPath: string) => new URL(relPath, import.meta.url);
+
 function tryLegacyCopy(text: string): boolean {
   try {
     if (typeof document === "undefined") return false;
@@ -654,7 +656,7 @@ export class MonacoNeovimClient {
     const debug = debugAuto ? true : Boolean(options.debug);
     this.opts = {
       worker: options.worker ?? null,
-      workerUrl: options.workerUrl ?? new URL("./nvimWorker.js", import.meta.url),
+      workerUrl: options.workerUrl ?? resolveDistUrl("./nvimWorker.js"),
       reuseWorker: options.reuseWorker ?? false,
       wasmPath: options.wasmPath ?? "",
       runtimePath: options.runtimePath ?? "",
