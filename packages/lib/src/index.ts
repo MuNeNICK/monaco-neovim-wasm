@@ -3,7 +3,8 @@ export type { MonacoNeovimOptions, StatusEmitter, PopupMenuItem, ClipboardAdapte
 export { NeovimWasmSession, isSharedArrayBufferAvailable } from "./neovimWasmSession";
 export type { NeovimWasmSessionInit, NeovimWasmSessionHandlers, NeovimWasmSessionStartOptions, NeovimWasmInputMode } from "./neovimWasmSession";
 
-const resolveDistUrl = (relPath: string) => new URL(relPath, import.meta.url);
-
-export const defaultWorkerUrl = resolveDistUrl("./nvimWorker.js");
-export const defaultWorkerUrlAsyncify = resolveDistUrl("./nvimWorkerAsyncify.js");
+// Must stay as a literal `new URL("...", import.meta.url)` so consumer bundlers
+// (ex: Vite) can statically detect + copy the worker file into their build.
+// The `.worker.js` suffix avoids Vite resolving to our TypeScript sources.
+export const defaultWorkerUrl = new URL("./nvimWorker.worker.js", import.meta.url);
+export const defaultWorkerUrlAsyncify = new URL("./nvimWorkerAsyncify.worker.js", import.meta.url);

@@ -9,7 +9,7 @@ export default defineConfig({
     lib: {
       entry: "src/nvimWorker.ts",
       formats: ["es"],
-      fileName: () => "nvimWorker.js",
+      fileName: () => "nvimWorker.worker.js",
     },
     rollupOptions: {
       output: {

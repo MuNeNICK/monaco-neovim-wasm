@@ -9,7 +9,7 @@ export default defineConfig({
     lib: {
       entry: "src/nvimWorkerAsyncify.ts",
       formats: ["es"],
-      fileName: () => "nvimWorkerAsyncify.js",
+      fileName: () => "nvimWorkerAsyncify.worker.js",
     },
     rollupOptions: {
       output: {

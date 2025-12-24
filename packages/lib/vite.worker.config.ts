@@ -11,9 +11,8 @@ export default defineConfig({
       },
       formats: ["es"],
       fileName: (_format, entryName) => (
-        entryName === "nvimWorkerAsyncify" ? "nvimWorkerAsyncify.js" : "nvimWorker.js"
+        entryName === "nvimWorkerAsyncify" ? "nvimWorkerAsyncify.worker.js" : "nvimWorker.worker.js"
       ),
     },
   },
 });
-
