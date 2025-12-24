@@ -9,11 +9,11 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@monaco-neovim-wasm/wasm-async": "0.1.13",
+    "@monaco-neovim-wasm/wasm-async": "0.1.16",
     "monaco-editor": "^0.55.1"
   },
   "devDependencies": {
     "typescript": "^5.4.0",
-    "vite": "^5.2.0"
+    "vite": "^7.3.0"
   }
 }
