@@ -26,6 +26,7 @@ await client.start();
 
 - You must also configure Monaco's web worker in your bundler/app; see `demo/` or `docs/usage.md`.
 - For `SharedArrayBuffer` input (requires COOP/COEP), switch to `@monaco-neovim-wasm/wasm`.
+- If your editor is externally bound (e.g. Yjs/CRDT), see "Sync strategy (Monaco ↔ Neovim)" in `docs/usage.md`.
 
 ## Packages
 - `@monaco-neovim-wasm/wasm`: normal build (SharedArrayBuffer; requires COOP/COEP)

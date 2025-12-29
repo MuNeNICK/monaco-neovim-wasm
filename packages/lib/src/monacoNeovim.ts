@@ -54,11 +54,17 @@ export type MonacoNeovimOptions = {
   metaKeysForNormalMode?: string[];
   metaKeysForInsertMode?: string[];
   searchHighlights?: boolean;
+  searchMatchBg?: string;
+  searchCurrentBg?: string;
   hostCommands?: boolean;
   fileSystem?: FileSystemAdapter | null;
   onHostCommand?: (cmd: HostCommand) => void | Promise<void>;
   status?: StatusEmitter;
   seedLines?: string[];
+  seedFromMonaco?: boolean;
+  seedMarkModified?: boolean;
+  initialSync?: "monacoToNvim" | "nvimToMonaco" | "none";
+  syncModelFromMonaco?: "insertOnly" | "always" | "never";
   seedName?: string;
   seedFiletype?: string;
   uiAttach?: boolean;
@@ -71,6 +77,8 @@ export type MonacoNeovimOptions = {
   startupCommands?: string[];
   startupLua?: string;
   visualThemeName?: string;
+  applyVisualTheme?: boolean;
+  visualSelectionBg?: string;
   rpcTimeoutMs?: number;
   clipboard?: ClipboardAdapter | null;
   onStderr?: (text: string) => void;
@@ -121,11 +129,17 @@ type MonacoNeovimResolvedOptions = {
   metaKeysForNormalMode?: string[];
   metaKeysForInsertMode?: string[];
   searchHighlights: boolean;
+  searchMatchBg: string;
+  searchCurrentBg: string;
   hostCommands: boolean;
   fileSystem?: FileSystemAdapter | null;
   onHostCommand?: (cmd: HostCommand) => void | Promise<void>;
   status: StatusEmitter;
   seedLines: string[];
+  seedFromMonaco: boolean;
+  seedMarkModified: boolean;
+  initialSync: "monacoToNvim" | "nvimToMonaco" | "none";
+  syncModelFromMonaco: "insertOnly" | "always" | "never";
   seedName: string;
   seedFiletype: string;
   uiAttach: boolean;
@@ -138,6 +152,8 @@ type MonacoNeovimResolvedOptions = {
   startupCommands: string[];
   startupLua: string;
   visualThemeName: string;
+  applyVisualTheme: boolean;
+  visualSelectionBg: string | null;
   rpcTimeoutMs: number;
   clipboard?: ClipboardAdapter | null;
   onStderr?: (text: string) => void;
@@ -186,6 +202,8 @@ const DEFAULT_SEED = [
   "",
   "print(greet('monaco'))",
 ];
+
+let globalInstanceCounter = 0;
 
 function tryLegacyCopy(text: string): boolean {
   try {
@@ -517,6 +535,9 @@ export class MonacoNeovimClient {
   private popupEl: HTMLDivElement | null = null;
   private popupItems: PopupMenuItem[] = [];
   private popupSelected = -1;
+  private readonly instanceId = ++globalInstanceCounter;
+  private readonly instanceClassName = `monaco-neovim-wasm-instance-${this.instanceId}`;
+  private cmdlineContainerPositionRestore: { el: HTMLElement; prev: string } | null = null;
   private pendingRedrawEvents: unknown[][] = [];
   private stagingRedrawFrame = false;
   private stagedCmdlineText: string | null | undefined = undefined;
@@ -566,6 +587,7 @@ export class MonacoNeovimClient {
   private modelContentDisposable: monaco.IDisposable | null = null;
   private originalOptions: Partial<MonacoEditor.IStandaloneEditorConstructionOptions> | null = null;
   private resyncTimer: number | null = null;
+  private monacoToNvimTimer: number | null = null;
 
   private debugLog(line: string): void {
     if (!this.opts.debug) return;
@@ -652,6 +674,8 @@ export class MonacoNeovimClient {
     // Query/global debugging must be able to override an app's default `debug: false`
     // without requiring local code changes (useful for private playgrounds).
     const debug = debugAuto ? true : Boolean(options.debug);
+    const initialSync = options.initialSync ?? "monacoToNvim";
+    const syncModelFromMonaco = options.syncModelFromMonaco ?? (initialSync === "monacoToNvim" ? "always" : "insertOnly");
     this.opts = {
       worker: options.worker ?? null,
       workerUrl: options.workerUrl ?? new URL("./nvimWorker.worker.js", import.meta.url),
@@ -682,11 +706,17 @@ export class MonacoNeovimClient {
       metaKeysForNormalMode: options.metaKeysForNormalMode,
       metaKeysForInsertMode: options.metaKeysForInsertMode,
       searchHighlights: options.searchHighlights ?? true,
+      searchMatchBg: options.searchMatchBg ?? "rgba(255, 210, 77, 0.22)",
+      searchCurrentBg: options.searchCurrentBg ?? "rgba(255, 210, 77, 0.45)",
       hostCommands: options.hostCommands ?? Boolean(options.onHostCommand || options.fileSystem),
       fileSystem: options.fileSystem,
       onHostCommand: options.onHostCommand,
       status: options.status ?? (() => {}),
-      seedLines: options.seedLines ?? DEFAULT_SEED,
+      seedLines: options.seedLines ?? [],
+      seedFromMonaco: options.seedFromMonaco ?? true,
+      seedMarkModified: options.seedMarkModified ?? false,
+      initialSync,
+      syncModelFromMonaco,
       seedName: options.seedName ?? "monaco-demo.lua",
       seedFiletype: options.seedFiletype ?? "lua",
       uiAttach: options.uiAttach ?? true,
@@ -704,6 +734,8 @@ export class MonacoNeovimClient {
       ],
       startupLua: options.startupLua ?? "",
       visualThemeName: options.visualThemeName ?? "nvim-visual",
+      applyVisualTheme: options.applyVisualTheme ?? false,
+      visualSelectionBg: options.visualSelectionBg ?? null,
       rpcTimeoutMs: options.rpcTimeoutMs ?? 8000,
       clipboard: options.clipboard,
       onStderr: options.onStderr,
@@ -735,7 +767,7 @@ export class MonacoNeovimClient {
 
   async start(seedLines?: string[]): Promise<void> {
     this.stop(true);
-    this.nextSeedLines = seedLines ?? null;
+    this.nextSeedLines = (seedLines && seedLines.length) ? seedLines : null;
 
     try {
       const initialSize = this.opts.autoResize ? this.computeGridSize() : { cols: this.opts.cols, rows: this.opts.rows };
@@ -884,6 +916,10 @@ export class MonacoNeovimClient {
       clearTimeout(this.resyncTimer);
       this.resyncTimer = null;
     }
+    if (this.monacoToNvimTimer) {
+      clearTimeout(this.monacoToNvimTimer);
+      this.monacoToNvimTimer = null;
+    }
     if (this.resizeTimer) {
       clearTimeout(this.resizeTimer);
       this.resizeTimer = null;
@@ -971,6 +1007,11 @@ export class MonacoNeovimClient {
   private attachEditorListeners(): void {
     this.disposeEditorListeners();
     const EditorOption = monaco.editor.EditorOption;
+    try {
+      const root = this.editor.getDomNode();
+      if (root) root.classList.add(this.instanceClassName);
+    } catch (_) {
+    }
     try {
       const fontInfo = this.editor.getOption(EditorOption.fontInfo);
       this.initialCursorWidth = this.editor.getOption(EditorOption.cursorWidth) || 0;
@@ -1199,7 +1240,11 @@ export class MonacoNeovimClient {
     try {
       const style = window.getComputedStyle(container);
       if (style.position === "static") {
-        (container as HTMLElement).style.position = "relative";
+        const el = container as HTMLElement;
+        if (!this.cmdlineContainerPositionRestore) {
+          this.cmdlineContainerPositionRestore = { el, prev: String(el.style.position ?? "") };
+        }
+        el.style.position = "relative";
       }
     } catch (_) {
     }
@@ -1326,6 +1371,13 @@ export class MonacoNeovimClient {
       this.preeditEl = null;
       this.preeditVisible = false;
     }
+    if (this.cmdlineContainerPositionRestore) {
+      try {
+        this.cmdlineContainerPositionRestore.el.style.position = this.cmdlineContainerPositionRestore.prev;
+      } catch (_) {
+      }
+      this.cmdlineContainerPositionRestore = null;
+    }
     if (this.messageTimer) {
       clearTimeout(this.messageTimer);
       this.messageTimer = null;
@@ -1333,6 +1385,10 @@ export class MonacoNeovimClient {
     if (this.resyncTimer) {
       clearTimeout(this.resyncTimer);
       this.resyncTimer = null;
+    }
+    if (this.monacoToNvimTimer) {
+      clearTimeout(this.monacoToNvimTimer);
+      this.monacoToNvimTimer = null;
     }
     if (this.searchRefreshTimer) {
       clearTimeout(this.searchRefreshTimer);
@@ -1348,6 +1404,11 @@ export class MonacoNeovimClient {
     this.pendingResyncAfterComposition = false;
     this.delegateInsertToMonaco = false;
     this.applyingFromNvim = false;
+    try {
+      const root = this.editor.getDomNode();
+      if (root) root.classList.remove(this.instanceClassName);
+    } catch (_) {
+    }
     if (this.cursorSyncTimer) {
       clearTimeout(this.cursorSyncTimer);
       this.cursorSyncTimer = null;
@@ -1441,11 +1502,52 @@ export class MonacoNeovimClient {
       if (attached !== true) throw new Error("nvim_buf_attach failed");
       this.ensureActiveState();
       if (this.opts.syncTabstop) this.syncTabstopFromMonaco();
-      const lines = await this.rpcCall("nvim_buf_get_lines", [id, 0, -1, false]);
-      this.applyBuffer(Array.isArray(lines) ? lines as string[] : [""]);
-      const seeded = await this.seedBuffer(id, this.nextSeedLines);
+
+      const seedFromMonaco = () => {
+        if (!this.opts.seedFromMonaco) return null;
+        const model = this.editor.getModel();
+        if (!model) return null;
+        const text = model.getValue();
+        const normalized = String(text ?? "").replace(/\r\n?/g, "\n");
+        if (!normalized) return null;
+        return normalized.split("\n");
+      };
+
+      const seedCandidate =
+        (this.nextSeedLines && this.nextSeedLines.length ? this.nextSeedLines : null)
+        ?? (this.opts.seedLines && this.opts.seedLines.length ? this.opts.seedLines : null)
+        ?? seedFromMonaco();
       this.nextSeedLines = null;
-      if (seeded && seeded.length) this.applyBuffer(seeded);
+
+      const syncMode = this.opts.initialSync;
+      if (syncMode === "none") {
+        // Don't touch Monaco or seed Neovim; callers can coordinate their own hydration/sync.
+      } else if (syncMode === "monacoToNvim") {
+        // In embedded/collaborative editors, Monaco is often already bound to an external source (e.g. Yjs).
+        // Avoid mutating Monaco on start; instead seed Neovim from Monaco (or explicit seedLines) so edits flow Monaco -> Neovim.
+        if (seedCandidate && seedCandidate.length) {
+          const seeded = await this.seedBuffer(id, seedCandidate);
+          if (!seeded) {
+            // Fall back to whatever Neovim has if seeding fails.
+            const lines = await this.rpcCall("nvim_buf_get_lines", [id, 0, -1, false]);
+            this.applyBuffer(Array.isArray(lines) ? (lines as string[]) : [""]);
+          }
+        }
+      } else {
+        // "nvimToMonaco": reflect Neovim buffer into Monaco (optionally after seeding).
+        if (seedCandidate && seedCandidate.length) {
+          const seeded = await this.seedBuffer(id, seedCandidate);
+          if (seeded && seeded.length) {
+            this.applyBuffer(seeded);
+          } else {
+            const lines = await this.rpcCall("nvim_buf_get_lines", [id, 0, -1, false]);
+            this.applyBuffer(Array.isArray(lines) ? (lines as string[]) : [""]);
+          }
+        } else {
+          const lines = await this.rpcCall("nvim_buf_get_lines", [id, 0, -1, false]);
+          this.applyBuffer(Array.isArray(lines) ? (lines as string[]) : [""]);
+        }
+      }
       try {
         const st = this.ensureActiveState();
         if (st) {
@@ -1990,7 +2092,11 @@ export class MonacoNeovimClient {
     try {
       const style = window.getComputedStyle(container);
       if (style.position === "static") {
-        (container as HTMLElement).style.position = "relative";
+        const el = container as HTMLElement;
+        if (!this.cmdlineContainerPositionRestore) {
+          this.cmdlineContainerPositionRestore = { el, prev: String(el.style.position ?? "") };
+        }
+        el.style.position = "relative";
       }
     } catch (_) {
     }
@@ -2870,6 +2976,26 @@ export class MonacoNeovimClient {
     }, 50);
   }
 
+  private scheduleSyncBufferToNvim(): void {
+    if (this.monacoToNvimTimer) return;
+    this.monacoToNvimTimer = window.setTimeout(() => {
+      this.monacoToNvimTimer = null;
+      this.syncBufferToNvimNow();
+    }, 60);
+  }
+
+  private syncBufferToNvimNow(): void {
+    if (!this.session || !this.session.isRunning()) return;
+    if (!this.bufHandle) return;
+    const model = this.editor.getModel();
+    if (!model) return;
+    try {
+      const lines = model.getLinesContent?.() ?? model.getValue().split(/\r?\n/);
+      this.sendNotify("nvim_buf_set_lines", [this.bufHandle, 0, -1, false, lines]);
+    } catch (_) {
+    }
+  }
+
   private async resyncBufferFromNvim(): Promise<void> {
     if (this.compositionActive) return;
     if (!this.session || !this.session.isRunning()) return;
@@ -2904,15 +3030,15 @@ export class MonacoNeovimClient {
   private ensureVisualStyle(): void {
     if (!this.visualStyleEl) {
       const el = document.createElement("style");
-      el.id = "monaco-neovim-wasm-visual-style";
+      el.id = `monaco-neovim-wasm-visual-style-${this.instanceId}`;
       el.textContent = `
-.monaco-neovim-visual-line {
+.${this.instanceClassName} .monaco-neovim-visual-line {
   background-color: ${this.visualBgCss};
 }
-.monaco-neovim-visual-inline {
+.${this.instanceClassName} .monaco-neovim-visual-inline {
   background-color: ${this.visualBgCss};
 }
-.monaco-neovim-visual-virtual {
+.${this.instanceClassName} .monaco-neovim-visual-virtual {
   position: absolute;
   background-color: ${this.visualBgCss};
   pointer-events: none;
@@ -2929,13 +3055,13 @@ export class MonacoNeovimClient {
     this.visualBgCss = next;
     if (this.visualStyleEl) {
       this.visualStyleEl.textContent = `
-.monaco-neovim-visual-line {
+.${this.instanceClassName} .monaco-neovim-visual-line {
   background-color: ${this.visualBgCss};
 }
-.monaco-neovim-visual-inline {
+.${this.instanceClassName} .monaco-neovim-visual-inline {
   background-color: ${this.visualBgCss};
 }
-.monaco-neovim-visual-virtual {
+.${this.instanceClassName} .monaco-neovim-visual-virtual {
   position: absolute;
   background-color: ${this.visualBgCss};
   pointer-events: none;
@@ -2953,7 +3079,7 @@ export class MonacoNeovimClient {
       ?? (root.querySelector(".view-overlays") as HTMLElement | null)
       ?? root;
     const el = document.createElement("div");
-    el.id = "monaco-neovim-wasm-visual-virtual-overlay";
+    el.id = `monaco-neovim-wasm-visual-virtual-overlay-${this.instanceId}`;
     el.style.position = "absolute";
     el.style.left = "0";
     el.style.top = "0";
@@ -3060,13 +3186,13 @@ export class MonacoNeovimClient {
   private ensureSearchStyle(): void {
     if (this.searchStyleEl) return;
     const el = document.createElement("style");
-    el.id = "monaco-neovim-wasm-search-style";
+    el.id = `monaco-neovim-wasm-search-style-${this.instanceId}`;
     el.textContent = `
-.monaco-neovim-search-match {
-  background-color: rgba(255, 210, 77, 0.22);
+.${this.instanceClassName} .monaco-neovim-search-match {
+  background-color: ${this.opts.searchMatchBg};
 }
-.monaco-neovim-search-current {
-  background-color: rgba(255, 210, 77, 0.45);
+.${this.instanceClassName} .monaco-neovim-search-current {
+  background-color: ${this.opts.searchCurrentBg};
 }
 `;
     document.head.appendChild(el);
@@ -3844,12 +3970,19 @@ api.nvim_win_set_cursor(0, { b_line, b_col0 })
   private handleMonacoModelChange(ev: monaco.editor.IModelContentChangedEvent): void {
     if (!this.delegateInsertToMonaco) {
       // In non-insert delegation, Neovim is the source of truth and Monaco edits
-      // are unexpected; force a resync to correct any transient/bad keybinding effects.
+      // are unexpected by default; force a resync to correct any transient/bad keybinding effects.
+      //
+      // In collaborative/externally-bound editors (e.g. Yjs), Monaco can change
+      // outside of direct key input. In that mode, treat Monaco as authoritative
+      // and push changes into Neovim instead of reverting them.
       if (this.applyingFromNvim) return;
       if (!this.session || !this.session.isRunning()) return;
       if (!this.bufHandle) return;
       if (this.compositionActive || (ev as any)?.isComposing) return;
-      if (ev?.changes?.length) this.scheduleResync();
+      if (!ev?.changes?.length) return;
+      const mode = this.opts.syncModelFromMonaco;
+      if (mode === "always") this.scheduleSyncBufferToNvim();
+      else if (mode !== "never") this.scheduleResync();
       return;
     }
     if (this.applyingFromNvim) return;
@@ -4553,20 +4686,39 @@ vim.rpcnotify(chan, "monaco_buf_enter", {
 
   private async syncVisualSelectionColor(): Promise<void> {
     try {
+      if (this.opts.visualSelectionBg) {
+        const main = this.opts.visualSelectionBg;
+        if (this.opts.applyVisualTheme) {
+          monaco.editor.defineTheme(this.opts.visualThemeName, {
+            base: "vs-dark",
+            inherit: true,
+            rules: [],
+            colors: {
+              "editor.selectionBackground": main,
+              "editor.selectionHighlightBackground": main,
+            },
+          });
+          this.editor.updateOptions({ theme: this.opts.visualThemeName });
+        }
+        this.setVisualBgCss(main);
+        return;
+      }
       const hex = await this.fetchVisualBg();
       const base = hex || "#3e4451";
       const main = withAlpha(base, 0.45);
       const highlight = withAlpha(base, 0.3);
-      monaco.editor.defineTheme(this.opts.visualThemeName, {
-        base: "vs-dark",
-        inherit: true,
-        rules: [],
-        colors: {
-          "editor.selectionBackground": main,
-          "editor.selectionHighlightBackground": highlight,
-        },
-      });
-      this.editor.updateOptions({ theme: this.opts.visualThemeName });
+      if (this.opts.applyVisualTheme) {
+        monaco.editor.defineTheme(this.opts.visualThemeName, {
+          base: "vs-dark",
+          inherit: true,
+          rules: [],
+          colors: {
+            "editor.selectionBackground": main,
+            "editor.selectionHighlightBackground": highlight,
+          },
+        });
+        this.editor.updateOptions({ theme: this.opts.visualThemeName });
+      }
       this.setVisualBgCss(main);
     } catch (_) {
     }
@@ -4630,12 +4782,23 @@ vim.rpcnotify(chan, "monaco_buf_enter", {
     const seed = seedOverride ?? this.opts.seedLines;
     if (!seed || !seed.length) return null;
     try {
+      let restoreModifiable: boolean | null = null;
+      try {
+        const mod = await this.rpcCall("nvim_buf_get_option", [buf, "modifiable"]);
+        if (mod === false) {
+          restoreModifiable = false;
+          await this.rpcCall("nvim_buf_set_option", [buf, "modifiable", true]);
+        }
+      } catch (_) {
+      }
       await this.rpcCall("nvim_buf_set_lines", [buf, 0, -1, false, seed]);
-      await this.rpcCall("nvim_buf_set_option", [buf, "modifiable", true]);
-      await this.rpcCall("nvim_buf_set_option", [buf, "modified", true]);
+      await this.rpcCall("nvim_buf_set_option", [buf, "modified", Boolean(this.opts.seedMarkModified)]);
       await this.rpcCall("nvim_buf_set_option", [buf, "buftype", ""]);
       await this.rpcCall("nvim_buf_set_option", [buf, "filetype", this.opts.seedFiletype]);
       await this.rpcCall("nvim_buf_set_name", [buf, this.opts.seedName]);
+      if (restoreModifiable === false) {
+        try { await this.rpcCall("nvim_buf_set_option", [buf, "modifiable", false]); } catch (_) {}
+      }
       return seed;
     } catch (_) {
       return null;

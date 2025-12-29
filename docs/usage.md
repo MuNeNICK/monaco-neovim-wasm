@@ -45,6 +45,35 @@ import { createMonacoNeovim } from "@monaco-neovim-wasm/wasm-async";
 
 ## Common options
 
+### Sync strategy (Monaco ↔ Neovim)
+
+This library supports multiple **sync strategies** depending on how your app manages text:
+
+- Some apps treat **Monaco as the source of truth** (e.g. Yjs/CRDT binding, remote updates, programmatic `model.setValue`).
+- Other apps want **Neovim as the source of truth** (strict modal editing; reject unexpected host edits).
+
+These behaviors are controlled by two options:
+
+- `initialSync` (default: `"monacoToNvim"`): what happens at `start()` time.
+  - `"monacoToNvim"`: seed Neovim from the current Monaco model (or `seedLines`); does **not** mutate Monaco.
+  - `"nvimToMonaco"`: reflect Neovim buffer into Monaco (optionally after seeding).
+  - `"none"`: do nothing; host coordinates hydration/sync manually.
+- `syncModelFromMonaco` (default depends on `initialSync`):
+  - Default is `"always"` when `initialSync === "monacoToNvim"` (collab-friendly).
+  - Default is `"insertOnly"` otherwise (stricter).
+  - `"always"`: when Monaco changes outside insert-mode delegation, push Monaco → Neovim (currently as full-buffer `nvim_buf_set_lines`).
+  - `"insertOnly"`: outside insert-mode delegation, treat Monaco edits as unexpected and resync Monaco from Neovim (prevents desync from accidental host edits).
+  - `"never"`: ignore Monaco edits outside insert-mode delegation (use only if you fully control external mutations; can desync).
+
+Recommended presets:
+
+- Collaborative / externally-bound editors (Yjs, remote updates):
+  - `initialSync: "monacoToNvim"` (default)
+  - `syncModelFromMonaco: "always"` (default in this mode)
+- Strict modal editing (host edits should be rejected):
+  - `initialSync: "nvimToMonaco"`
+  - `syncModelFromMonaco: "insertOnly"`
+
 ### Assets / worker
 
 - `wasmPath` / `runtimePath`: override the shipped asset URLs (required when using `@monaco-neovim-wasm/lib`)
@@ -106,6 +135,7 @@ These features delegate some "screen line / viewport" behavior to Monaco for bet
 ### Search highlights
 
 - `searchHighlights`: render Neovim search highlights as Monaco decorations (visible viewport)
+- `searchMatchBg` / `searchCurrentBg`: customize highlight colors without changing the Monaco theme
 
 ### Clipboard (yank / paste)
 
@@ -128,6 +158,12 @@ Notes:
 ### Multiple buffers
 
 When Neovim switches buffers (`:bnext`, `:buffer`, …), the client swaps Monaco models accordingly.
+
+### Visual selection highlight
+
+- By default, visual selection is drawn via CSS overlays and does not change your Monaco theme.
+- `visualSelectionBg`: override the visual selection background color (CSS string).
+- `applyVisualTheme: true`: additionally apply a Monaco theme override so Monaco's native selection colors match Neovim's `Visual` highlight group.
 
 ## Loading Vimscript overrides
 
