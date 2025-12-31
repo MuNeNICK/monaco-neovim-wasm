@@ -54,8 +54,6 @@ export type MonacoNeovimOptions = {
   metaKeysForNormalMode?: string[];
   metaKeysForInsertMode?: string[];
   searchHighlights?: boolean;
-  searchMatchBg?: string;
-  searchCurrentBg?: string;
   hostCommands?: boolean;
   fileSystem?: FileSystemAdapter | null;
   onHostCommand?: (cmd: HostCommand) => void | Promise<void>;
@@ -76,9 +74,6 @@ export type MonacoNeovimOptions = {
   };
   startupCommands?: string[];
   startupLua?: string;
-  visualThemeName?: string;
-  applyVisualTheme?: boolean;
-  visualSelectionBg?: string;
   rpcTimeoutMs?: number;
   clipboard?: ClipboardAdapter | null;
   onStderr?: (text: string) => void;
@@ -129,8 +124,6 @@ type MonacoNeovimResolvedOptions = {
   metaKeysForNormalMode?: string[];
   metaKeysForInsertMode?: string[];
   searchHighlights: boolean;
-  searchMatchBg: string;
-  searchCurrentBg: string;
   hostCommands: boolean;
   fileSystem?: FileSystemAdapter | null;
   onHostCommand?: (cmd: HostCommand) => void | Promise<void>;
@@ -151,9 +144,6 @@ type MonacoNeovimResolvedOptions = {
   };
   startupCommands: string[];
   startupLua: string;
-  visualThemeName: string;
-  applyVisualTheme: boolean;
-  visualSelectionBg: string | null;
   rpcTimeoutMs: number;
   clipboard?: ClipboardAdapter | null;
   onStderr?: (text: string) => void;
@@ -233,151 +223,175 @@ function tryLegacyCopy(text: string): boolean {
 }
 
 const VISUAL_SELECTION_LUA = `
-	local api, fn = vim.api, vim.fn
+local api, fn = vim.api, vim.fn
+local ok_lsp, lsp = pcall(require, "vim.lsp")
+local has_lsp = ok_lsp and lsp and lsp.util and lsp.util.make_position_params and lsp.util.make_given_range_params
 
-	-- virtcol2col() returns a column (1-indexed) for the given virtual column.
-	-- Neovim <= 0.9 returns the *last* byte of a multibyte character, while Neovim >= 0.10 returns the *first* byte.
-	-- For our byte<->Monaco conversion we always want the 0-indexed *first* byte of the character.
-	local function virtcol2byte0(winid, lnum, virtcol)
-	  local byte0 = fn.virtcol2col(winid, lnum, virtcol) - 1
-	  if fn.has("nvim-0.10.0") == 1 then
-	    return byte0
-	  end
-	  local buf = api.nvim_win_get_buf(winid)
-	  local line = api.nvim_buf_get_lines(buf, lnum - 1, lnum, false)[1] or ""
-	  local char_idx = fn.charidx(line, byte0)
-	  local prefix = fn.strcharpart(line, 0, char_idx)
-	  return #prefix
-	end
+local function get_line(buf, line0)
+  local lines = api.nvim_buf_get_lines(buf, line0, line0 + 1, false)
+  return lines[1] or ""
+end
 
-	local function char_width_at_byte0(line, byte0)
-	  if not line or line == "" then return 1, "" end
-	  local b = math.max(0, math.min(#line, byte0 or 0))
-	  local char_idx = fn.charidx(line, b)
-	  local ch = fn.strcharpart(line, char_idx, 1)
-	  if ch == "\\t" then return 1, ch end
-	  local w = fn.strdisplaywidth(ch)
-	  if not w or w < 1 then w = 1 end
-	  return w, ch
-	end
+local function byte_col_to_character(buf, line0, col0)
+  local line = get_line(buf, line0)
+  return vim.str_utfindex(line, "utf-16", col0, false)
+end
 
-	local function start_vcol_at_byte0(line, byte0)
-	  if not line or line == "" then return 1 end
-	  local b = math.max(0, math.min(#line, byte0 or 0))
-	  local char_idx = fn.charidx(line, b)
-	  local prefix = fn.strcharpart(line, 0, char_idx)
-	  return fn.strdisplaywidth(prefix) + 1
-	end
+local function make_position(buf, line1, col0)
+  local line0 = line1 - 1
+  local char = byte_col_to_character(buf, line0, col0)
+  return { line = line0, character = char }
+end
+
+local function make_position_params(win, buf)
+  if has_lsp then
+    return lsp.util.make_position_params(win, "utf-16").position
+  end
+  local cur = api.nvim_win_get_cursor(win)
+  return make_position(buf, cur[1], cur[2])
+end
+
+local function make_range(buf, start_pos, end_pos)
+  local s_line0 = start_pos[1] - 1
+  local e_line0 = end_pos[1] - 1
+  local s_char = byte_col_to_character(buf, s_line0, start_pos[2])
+  local e_char = byte_col_to_character(buf, e_line0, end_pos[2])
+  if vim.o.selection ~= "exclusive" then
+    e_char = e_char + 1
+  end
+  return { start = { line = s_line0, character = s_char }, ["end"] = { line = e_line0, character = e_char } }
+end
+
+local function make_range_params(buf, start_pos, end_pos)
+  if has_lsp then
+    return lsp.util.make_given_range_params(start_pos, end_pos, buf, "utf-16").range
+  end
+  return make_range(buf, start_pos, end_pos)
+end
+
+local function get_char_at(line, byte_col, buf)
+  buf = buf or api.nvim_get_current_buf()
+  local line_str = fn.getbufoneline(buf, line)
+  local char_idx = fn.charidx(line_str, (byte_col - 1))
+  local char_nr = fn.strgetchar(line_str, char_idx)
+  if char_nr ~= -1 then
+    return fn.nr2char(char_nr)
+  end
+  return nil
+end
+
+local function virtcol2col(winid, lnum, virtcol)
+  if fn.has("nvim-0.10.0") == 0 then
+    return fn.virtcol2col(winid, lnum, virtcol)
+  end
+  local byte_idx = fn.virtcol2col(winid, lnum, virtcol) - 1
+  local buf = api.nvim_win_get_buf(winid)
+  local line = api.nvim_buf_get_lines(buf, lnum - 1, lnum, false)[1] or ""
+  local char_idx = fn.charidx(line, byte_idx)
+  local prefix = fn.strcharpart(line, 0, char_idx + 1)
+  return #prefix
+end
 
 local function get_selections(win)
   win = win or api.nvim_get_current_win()
   local buf = api.nvim_win_get_buf(win)
-  local full_mode = api.nvim_get_mode().mode or ""
-  local mode = full_mode:sub(-1)
-  local is_visual = mode:match("[vV\\22sS\\19]")
+  local mode = api.nvim_get_mode().mode
+  local is_visual = mode:match("[vV\\022]")
 
-  if not is_visual then
-    local cur = api.nvim_win_get_cursor(win)
-    local line0 = (cur[1] or 1) - 1
-    local col0 = cur[2] or 0
-    return { { start = { line = line0, col = col0 }, ["end"] = { line = line0, col = col0 }, inclusive = false } }
+  local function wincall(cb)
+    return api.nvim_win_call(win, cb)
   end
 
-  local sline = fn.line('v') - 1
-  local scol = fn.col('v') - 1
-  local eline = fn.line('.') - 1
-  local ecol = fn.col('.') - 1
+  if not is_visual then
+    local pos = make_position_params(win, buf)
+    return { { start = pos, ["end"] = pos } }
+  end
 
-  if mode == "v" or mode == "V" then
-    local start_left = true
-    if sline > eline or (sline == eline and scol > ecol) then
-      start_left = false
-      sline, eline = eline, sline
-      scol, ecol = ecol, scol
+  if mode:lower() == "v" then
+    local start_pos, end_pos
+    wincall(function()
+      start_pos = { fn.line("v"), fn.col("v") - 1 }
+      end_pos = { fn.line("."), fn.col(".") - 1 }
+    end)
+    local start_from_left = true
+    if start_pos[1] > end_pos[1] or (start_pos[1] == end_pos[1] and start_pos[2] > end_pos[2]) then
+      start_from_left = false
+      start_pos, end_pos = end_pos, start_pos
     end
     if mode == "V" then
-      scol = 0
-      local line = api.nvim_buf_get_lines(buf, eline, eline + 1, false)[1] or ""
-      ecol = #line
+      start_pos = { start_pos[1], 0 }
+      end_pos = { end_pos[1], #(fn.getbufline(buf, end_pos[1])[1] or "") }
     end
-    local range = {
-      start = { line = sline, col = scol },
-      ["end"] = { line = eline, col = ecol },
-      inclusive = (vim.o.selection or "inclusive") == "inclusive",
-    }
-    if not start_left then
-      range = { start = range["end"], ["end"] = range.start, inclusive = range.inclusive }
+    local range = make_range_params(buf, start_pos, end_pos)
+    if not start_from_left then
+      range = { start = range["end"], ["end"] = range.start }
     end
     return { range }
   end
 
-	  local ranges = {}
-	  local inclusive = (vim.o.selection or "inclusive") == "inclusive"
-	  local start_vcol, end_vcol = fn.virtcol("v"), fn.virtcol(".")
-	  if not inclusive then
-	    -- 'selection=exclusive' excludes the cursor column from Visual selections.
-	    if end_vcol >= start_vcol then
-	      end_vcol = end_vcol - 1
-	    else
-	      end_vcol = end_vcol + 1
-	    end
-	    if end_vcol < 1 then end_vcol = 1 end
-	  end
-	  local left_vcol, right_vcol = math.min(start_vcol, end_vcol), math.max(start_vcol, end_vcol)
-	  local top, bot = math.min(sline, eline), math.max(sline, eline)
-	  for lnum = top, bot do
-	    local line = api.nvim_buf_get_lines(buf, lnum, lnum + 1, false)[1] or ""
-	    local disp = fn.strdisplaywidth(line)
-	    local line_bytes = #line
-	    local col_a = left_vcol > disp and line_bytes or virtcol2byte0(win, lnum + 1, left_vcol)
-	    local col_b = right_vcol > disp and line_bytes or virtcol2byte0(win, lnum + 1, right_vcol)
-	    if col_a > line_bytes then col_a = line_bytes end
-	    if col_b > line_bytes then col_b = line_bytes end
-
-	    local eff_left_vcol = left_vcol
-	    if left_vcol <= disp then
-	      local start_vcol_a = start_vcol_at_byte0(line, col_a)
-	      local w_a, ch_a = char_width_at_byte0(line, col_a)
-	      if ch_a ~= "\\t" and w_a > 1 and eff_left_vcol > start_vcol_a then
-	        eff_left_vcol = start_vcol_a
-	      end
-	    end
-
-	    local eff_right_vcol = right_vcol
-	    if right_vcol <= disp then
-	      local start_vcol_b = start_vcol_at_byte0(line, col_b)
-	      local w_b, ch_b = char_width_at_byte0(line, col_b)
-	      if ch_b ~= "\\t" and w_b > 1 then
-	        eff_right_vcol = start_vcol_b + (w_b - 1)
-	      end
-	    end
-
-	    if eff_right_vcol < eff_left_vcol then
-	      eff_left_vcol, eff_right_vcol = eff_right_vcol, eff_left_vcol
-	    end
-	    table.insert(ranges, {
-	      start = { line = lnum, col = col_a },
-	      ["end"] = { line = lnum, col = col_b },
-	      inclusive = inclusive,
-	      start_vcol = eff_left_vcol,
-	      end_vcol = eff_right_vcol,
-	      disp = disp,
-	    })
-	  end
-
-  if #ranges == 0 then
-    local cur = api.nvim_win_get_cursor(win)
-    local line0 = (cur[1] or 1) - 1
-    local col0 = cur[2] or 0
-    return { { start = { line = line0, col = col0 }, ["end"] = { line = line0, col = col0 }, inclusive = false } }
+  local ranges = {}
+  local start_line_1, end_line_1, start_vcol, end_vcol
+  wincall(function()
+    start_line_1 = fn.line("v")
+    end_line_1 = fn.line(".")
+    start_vcol = fn.virtcol("v")
+    end_vcol = fn.virtcol(".")
+  end)
+  local curr_line_1 = end_line_1
+  local top_to_bottom = start_line_1 < end_line_1 or (start_line_1 == end_line_1 and start_vcol <= end_vcol)
+  local start_from_left = end_vcol >= start_vcol
+  if start_line_1 > end_line_1 then
+    start_line_1, end_line_1 = end_line_1, start_line_1
+  end
+  if start_vcol > end_vcol then
+    start_vcol, end_vcol = end_vcol, start_vcol
   end
 
+  for line_1 = start_line_1, end_line_1 do
+    local line_0 = line_1 - 1
+    local line_text = fn.getbufline(buf, line_1)[1] or ""
+    local line_diswidth = wincall(function()
+      return fn.strdisplaywidth(line_text)
+    end)
+    if start_vcol > line_diswidth then
+      if line_1 == curr_line_1 then
+        local pos = { line = line_0, character = ({ vim.str_utfindex(line_text) })[2] }
+        table.insert(ranges, { start = pos, ["end"] = pos })
+      end
+    else
+      local start_col = virtcol2col(win, line_1, start_vcol)
+      local end_col = virtcol2col(win, line_1, end_vcol)
+      local start_col_offset = fn.strlen(get_char_at(line_1, start_col, buf) or "")
+      local end_col_offset = fn.strlen(get_char_at(line_1, end_col, buf) or "")
+      local range = make_range_params(
+        buf,
+        { line_1, math.max(0, start_col - start_col_offset) },
+        { line_1, math.max(0, end_col - end_col_offset) }
+      )
+      if not start_from_left then
+        range = { start = range["end"], ["end"] = range.start }
+      end
+      table.insert(ranges, range)
+    end
+  end
+
+  if #ranges == 0 then
+    local pos = make_position_params(win, buf)
+    return { { start = pos, ["end"] = pos } }
+  end
+
+  if top_to_bottom then
+    local ret = {}
+    for i = #ranges, 1, -1 do
+      table.insert(ret, ranges[i])
+    end
+    return ret
+  end
   return ranges
 end
 
-	local tail = (api.nvim_get_mode().mode or ""):sub(-1)
-	return { tail = tail, ranges = get_selections(...) }
-	`;
+return get_selections(...)
+`;
 
 const SEARCH_HIGHLIGHT_LUA = `
 local api, fn = vim.api, vim.fn
@@ -485,12 +499,6 @@ export class MonacoNeovimClient {
   private lastMode = "";
   private visualSelectionToken = 0;
   private visualSelectionActive = false;
-  private visualDecorationIds: string[] = [];
-  private visualStyleEl: HTMLStyleElement | null = null;
-  private visualVirtualOverlayEl: HTMLDivElement | null = null;
-  private visualVirtualRawRanges: any[] = [];
-  private visualVirtualActive = false;
-  private visualBgCss = "rgba(62, 68, 81, 0.45)";
   private monacoPrevOccurrencesHighlight: ("off" | "singleFile" | "multiFile") | null = null;
   private monacoPrevSelectionHighlight: boolean | null = null;
   private monacoPrevSelectionHighlightMultiline: boolean | null = null;
@@ -498,6 +506,10 @@ export class MonacoNeovimClient {
   private cursorRefreshTimer: number | null = null;
   private cursorRefreshInFlight = false;
   private cursorRefreshPending = false;
+  private cursorUpdateTimer: number | null = null;
+  private pendingCursorUpdate: { line: number; col: number } | null = null;
+  private pendingNvimBufUpdates = 0;
+  private pendingVisualRefresh = false;
   private disposables: monaco.IDisposable[] = [];
   private notifyChain: Promise<void> = Promise.resolve();
   private nvimChannelId: number | null = null;
@@ -510,7 +522,6 @@ export class MonacoNeovimClient {
   private metaKeysNormal: Set<string> | null = null;
   private metaKeysInsert: Set<string> | null = null;
   private searchDecorationIds: string[] = [];
-  private searchStyleEl: HTMLStyleElement | null = null;
   private searchRefreshTimer: number | null = null;
   private searchRefreshInFlight = false;
   private searchRefreshPending = false;
@@ -518,6 +529,10 @@ export class MonacoNeovimClient {
   private visualSelectionRefreshTimer: number | null = null;
   private selectionSyncTimer: number | null = null;
   private pendingSelection: monaco.Selection | null = null;
+  private visualModeCheckUntil = 0;
+  private lastVisualSelectionAt = 0;
+  private selectionRenderFrame: number | null = null;
+  private pendingVisualSelections: monaco.Selection[] | null = null;
   private lastCursorStyle: MonacoEditor.IStandaloneEditorConstructionOptions["cursorStyle"] | null = null;
   private lastCursorBlink: MonacoEditor.IStandaloneEditorConstructionOptions["cursorBlinking"] | null = null;
   private lastCursorWidth: number | null = null;
@@ -706,8 +721,6 @@ export class MonacoNeovimClient {
       metaKeysForNormalMode: options.metaKeysForNormalMode,
       metaKeysForInsertMode: options.metaKeysForInsertMode,
       searchHighlights: options.searchHighlights ?? true,
-      searchMatchBg: options.searchMatchBg ?? "rgba(255, 210, 77, 0.22)",
-      searchCurrentBg: options.searchCurrentBg ?? "rgba(255, 210, 77, 0.45)",
       hostCommands: options.hostCommands ?? Boolean(options.onHostCommand || options.fileSystem),
       fileSystem: options.fileSystem,
       onHostCommand: options.onHostCommand,
@@ -733,9 +746,6 @@ export class MonacoNeovimClient {
         ...(options.clipboard === null ? [] : ["set clipboard=unnamedplus"]),
       ],
       startupLua: options.startupLua ?? "",
-      visualThemeName: options.visualThemeName ?? "nvim-visual",
-      applyVisualTheme: options.applyVisualTheme ?? false,
-      visualSelectionBg: options.visualSelectionBg ?? null,
       rpcTimeoutMs: options.rpcTimeoutMs ?? 8000,
       clipboard: options.clipboard,
       onStderr: options.onStderr,
@@ -882,6 +892,11 @@ export class MonacoNeovimClient {
       clearTimeout(this.cursorSyncTimer);
       this.cursorSyncTimer = null;
     }
+    if (this.cursorUpdateTimer) {
+      clearTimeout(this.cursorUpdateTimer);
+      this.cursorUpdateTimer = null;
+    }
+    this.pendingCursorUpdate = null;
     this.nvimChannelId = null;
     this.hostAutocmdInstalled = false;
     this.notifyChain = Promise.resolve();
@@ -1063,6 +1078,7 @@ export class MonacoNeovimClient {
       this.editor.onMouseDown((ev) => this.handleMouse(ev)),
       this.editor.onDidChangeCursorSelection((ev) => this.handleSelection(ev)),
       this.editor.onDidChangeCursorPosition((ev) => {
+        const prevCursor = this.lastCursorPos;
         const cur = this.editor.getPosition();
         if (cur) this.lastCursorPos = cur;
         if (this.delegateInsertToMonaco) {
@@ -1090,9 +1106,16 @@ export class MonacoNeovimClient {
           return;
         }
         if (ev.source === "keyboard") {
-          this.suppressCursorSync = true;
-          this.editor.setPosition(this.lastCursorPos);
-          this.suppressCursorSync = false;
+          if (isVisualMode(this.lastMode)) {
+            const restore = this.pendingVisualSelections;
+            if (restore && restore.length) {
+              if (prevCursor) this.lastCursorPos = prevCursor;
+              this.suppressCursorSync = true;
+              this.editor.setSelections(restore);
+              this.suppressCursorSync = false;
+              this.scheduleSelectionRender();
+            }
+          }
           return;
         }
       }),
@@ -1106,27 +1129,6 @@ export class MonacoNeovimClient {
         if (!this.opts.searchHighlights) return;
         if (this.compositionActive) return;
         this.requestSearchHighlightRefresh();
-      }),
-    );
-    this.disposables.push(
-      this.editor.onDidScrollChange(() => {
-        if (!this.visualVirtualActive) return;
-        this.renderVisualVirtualOverlay();
-      }),
-      this.editor.onDidLayoutChange(() => {
-        if (!this.visualVirtualActive) return;
-        this.renderVisualVirtualOverlay();
-      }),
-      this.editor.onDidChangeConfiguration((e) => {
-        if (!this.visualVirtualActive) return;
-        if (
-          e.hasChanged(EditorOption.fontInfo)
-          || e.hasChanged(EditorOption.lineHeight)
-          || e.hasChanged(EditorOption.fontSize)
-          || e.hasChanged(EditorOption.fontFamily)
-        ) {
-          this.renderVisualVirtualOverlay();
-        }
       }),
     );
     this.disposables.push(
@@ -1337,23 +1339,9 @@ export class MonacoNeovimClient {
       try { this.modelContentDisposable.dispose(); } catch (_) {}
       this.modelContentDisposable = null;
     }
-    this.clearVisualDecorations();
+    this.clearVisualSelection();
     this.clearSearchHighlights();
     this.setMonacoHighlightsSuppressed(false);
-    if (this.searchStyleEl) {
-      try { this.searchStyleEl.remove(); } catch (_) {}
-      this.searchStyleEl = null;
-    }
-    if (this.visualStyleEl) {
-      try { this.visualStyleEl.remove(); } catch (_) {}
-      this.visualStyleEl = null;
-    }
-    if (this.visualVirtualOverlayEl) {
-      try { this.visualVirtualOverlayEl.remove(); } catch (_) {}
-      this.visualVirtualOverlayEl = null;
-    }
-    this.visualVirtualRawRanges = [];
-    this.visualVirtualActive = false;
     if (this.cmdlineEl) {
       try { this.cmdlineEl.remove(); } catch (_) {}
       this.cmdlineEl = null;
@@ -1498,10 +1486,6 @@ export class MonacoNeovimClient {
       const buf = await this.rpcCall("nvim_get_current_buf", []);
       const id = extractBufId(buf) ?? 1;
       this.bufHandle = id;
-      const attached = await this.rpcCall("nvim_buf_attach", [id, true, {}]);
-      if (attached !== true) throw new Error("nvim_buf_attach failed");
-      this.ensureActiveState();
-      if (this.opts.syncTabstop) this.syncTabstopFromMonaco();
 
       const seedFromMonaco = () => {
         if (!this.opts.seedFromMonaco) return null;
@@ -1520,29 +1504,37 @@ export class MonacoNeovimClient {
       this.nextSeedLines = null;
 
       const syncMode = this.opts.initialSync;
+      let seededLines: string[] | null = null;
+      let attemptedSeed = false;
+      if (syncMode !== "none" && seedCandidate && seedCandidate.length) {
+        attemptedSeed = true;
+        seededLines = await this.seedBuffer(id, seedCandidate);
+      }
+
+      // Important: In "monacoToNvim" mode, Monaco is treated as the source of truth at startup.
+      // Attaching with `send_buffer=true` can emit an initial `nvim_buf_lines_event` for Neovim's
+      // default (often empty) buffer, which would overwrite Monaco (and any external bindings like Yjs).
+      const sendBufferOnAttach = syncMode === "nvimToMonaco";
+      const attached = await this.rpcCall("nvim_buf_attach", [id, sendBufferOnAttach, {}]);
+      if (attached !== true) throw new Error("nvim_buf_attach failed");
+      this.ensureActiveState();
+      if (this.opts.syncTabstop) this.syncTabstopFromMonaco();
+
       if (syncMode === "none") {
         // Don't touch Monaco or seed Neovim; callers can coordinate their own hydration/sync.
       } else if (syncMode === "monacoToNvim") {
         // In embedded/collaborative editors, Monaco is often already bound to an external source (e.g. Yjs).
         // Avoid mutating Monaco on start; instead seed Neovim from Monaco (or explicit seedLines) so edits flow Monaco -> Neovim.
-        if (seedCandidate && seedCandidate.length) {
-          const seeded = await this.seedBuffer(id, seedCandidate);
-          if (!seeded) {
-            // Fall back to whatever Neovim has if seeding fails.
-            const lines = await this.rpcCall("nvim_buf_get_lines", [id, 0, -1, false]);
-            this.applyBuffer(Array.isArray(lines) ? (lines as string[]) : [""]);
-          }
+        if (attemptedSeed && !seededLines) {
+          this.opts.status("warning: failed to seed Neovim from Monaco; leaving Monaco untouched", true);
         }
       } else {
         // "nvimToMonaco": reflect Neovim buffer into Monaco (optionally after seeding).
-        if (seedCandidate && seedCandidate.length) {
-          const seeded = await this.seedBuffer(id, seedCandidate);
-          if (seeded && seeded.length) {
-            this.applyBuffer(seeded);
-          } else {
-            const lines = await this.rpcCall("nvim_buf_get_lines", [id, 0, -1, false]);
-            this.applyBuffer(Array.isArray(lines) ? (lines as string[]) : [""]);
-          }
+        if (seededLines && seededLines.length) {
+          this.applyBuffer(seededLines);
+        } else if (seedCandidate && seedCandidate.length) {
+          const lines = await this.rpcCall("nvim_buf_get_lines", [id, 0, -1, false]);
+          this.applyBuffer(Array.isArray(lines) ? (lines as string[]) : [""]);
         } else {
           const lines = await this.rpcCall("nvim_buf_get_lines", [id, 0, -1, false]);
           this.applyBuffer(Array.isArray(lines) ? (lines as string[]) : [""]);
@@ -1703,8 +1695,11 @@ export class MonacoNeovimClient {
         this.lastCursorPos = validated;
         return;
       }
-      this.updateCursor(clamped.line, clamped.col);
-      if (isVisualMode(this.lastMode)) this.scheduleVisualSelectionRefresh();
+      this.scheduleCursorUpdate(clamped.line, clamped.col);
+      return;
+    }
+    if (method === "monaco_visual_changed") {
+      this.scheduleVisualSelectionRefresh();
       return;
     }
     if (method === "monaco_mode") {
@@ -1737,66 +1732,75 @@ export class MonacoNeovimClient {
       return;
     }
     if (method === "nvim_buf_lines_event") {
+      this.pendingNvimBufUpdates += 1;
       const [buf, _changedtick, firstline, lastline, linedata] = params;
       const id = extractBufId(buf);
-      if (!id) return;
-      const state = (this.bufHandle != null && id === this.bufHandle) ? this.ensureActiveState() : (this.buffers.get(id) ?? null);
-      if (!state) return;
-      if (this.bufHandle != null && id === this.bufHandle && this.delegateInsertToMonaco && !this.exitingInsertMode) {
-        // During insert-mode delegation, Monaco is the source of truth for the
-        // document. Neovim will echo our Monaco->Neovim changes back via
-        // nvim_buf_lines_event; applying them can create feedback loops and
-        // corrupt the model when patches are computed on partially-updated state.
-        // Ignore the echo window right after we flush Monaco edits to Neovim.
-        if (this.nowMs() < this.ignoreActiveBufLinesEventsUntil) return;
-      }
-      if (this.bufHandle != null && id === this.bufHandle && this.compositionActive) {
-        // Don't mutate the Monaco model during IME composition; it can cause the
-        // IME rendering/caret to glitch. We'll resync after composition ends.
-        this.pendingResyncAfterComposition = true;
-        return;
-      }
-
-      const model = state.model;
-      const fl = Number(firstline);
-      const ll = Number(lastline);
-      const newLines = Array.isArray(linedata) ? (linedata as unknown[]).map((l) => String(l ?? "")) : null;
-      const canPatch = model && Number.isInteger(fl) && Number.isInteger(ll) && fl >= 0 && ll >= fl && newLines;
-      if (canPatch) {
-        try {
-          const isActiveModel = this.bufHandle != null && id === this.bufHandle && this.editor.getModel() === model;
-          if (isActiveModel && this.delegateInsertToMonaco) {
-            const patch = this.computeLinePatch(model!, fl, ll, newLines!);
-            let isNoop = false;
-            try { isNoop = model!.getValueInRange(patch.range) === patch.text; } catch (_) {}
-            if (!isNoop) {
-              if (state.pendingFullSync || state.pendingBufEdits.length) {
-                // We're in the middle of applying Monaco->Neovim edits; applying
-                // Neovim line events now can race with our pending patches.
-                // Instead, resync the active buffer shortly.
-                this.scheduleResync();
-                return;
-              }
-              this.applyLinePatchToModel(model!, fl, ll, newLines!);
-              try { state.shadowLines = model!.getLinesContent(); } catch (_) {}
-            }
-          } else if (isActiveModel) {
-            this.applyLinePatch(model!, fl, ll, newLines!);
-          } else {
-            this.applyLinePatchToModel(model!, fl, ll, newLines!);
-          }
-        } catch (_) {
+      try {
+        if (!id) return;
+        const state = (this.bufHandle != null && id === this.bufHandle) ? this.ensureActiveState() : (this.buffers.get(id) ?? null);
+        if (!state) return;
+        if (this.bufHandle != null && id === this.bufHandle && this.delegateInsertToMonaco && !this.exitingInsertMode) {
+          // During insert-mode delegation, Monaco is the source of truth for the
+          // document. Neovim will echo our Monaco->Neovim changes back via
+          // nvim_buf_lines_event; applying them can create feedback loops and
+          // corrupt the model when patches are computed on partially-updated state.
+          // Ignore the echo window right after we flush Monaco edits to Neovim.
+          if (this.nowMs() < this.ignoreActiveBufLinesEventsUntil) return;
         }
-      } else {
-        try {
-          const allLines = await this.rpcCall("nvim_buf_get_lines", [id, 0, -1, false]);
-          const lines = Array.isArray(allLines) ? (allLines as string[]) : [""];
-          if (this.bufHandle != null && id === this.bufHandle && this.editor.getModel() === model) {
-            this.applyBuffer(lines);
-          } else {
-            this.setModelText(model!, lines);
+        if (this.bufHandle != null && id === this.bufHandle && this.compositionActive) {
+          // Don't mutate the Monaco model during IME composition; it can cause the
+          // IME rendering/caret to glitch. We'll resync after composition ends.
+          this.pendingResyncAfterComposition = true;
+          return;
+        }
+
+        const model = state.model;
+        const fl = Number(firstline);
+        const ll = Number(lastline);
+        const newLines = Array.isArray(linedata) ? (linedata as unknown[]).map((l) => String(l ?? "")) : null;
+        const canPatch = model && Number.isInteger(fl) && Number.isInteger(ll) && fl >= 0 && ll >= fl && newLines;
+        if (canPatch) {
+          try {
+            const isActiveModel = this.bufHandle != null && id === this.bufHandle && this.editor.getModel() === model;
+            if (isActiveModel && this.delegateInsertToMonaco) {
+              const patch = this.computeLinePatch(model!, fl, ll, newLines!);
+              let isNoop = false;
+              try { isNoop = model!.getValueInRange(patch.range) === patch.text; } catch (_) {}
+              if (!isNoop) {
+                if (state.pendingFullSync || state.pendingBufEdits.length) {
+                  // We're in the middle of applying Monaco->Neovim edits; applying
+                  // Neovim line events now can race with our pending patches.
+                  // Instead, resync the active buffer shortly.
+                  this.scheduleResync();
+                  return;
+                }
+                this.applyLinePatchToModel(model!, fl, ll, newLines!);
+                try { state.shadowLines = model!.getLinesContent(); } catch (_) {}
+              }
+            } else if (isActiveModel) {
+              this.applyLinePatch(model!, fl, ll, newLines!);
+            } else {
+              this.applyLinePatchToModel(model!, fl, ll, newLines!);
+            }
+          } catch (_) {
           }
-        } catch (_) {
+        } else {
+          try {
+            const allLines = await this.rpcCall("nvim_buf_get_lines", [id, 0, -1, false]);
+            const lines = Array.isArray(allLines) ? (allLines as string[]) : [""];
+            if (this.bufHandle != null && id === this.bufHandle && this.editor.getModel() === model) {
+              this.applyBuffer(lines);
+            } else {
+              this.setModelText(model!, lines);
+            }
+          } catch (_) {
+          }
+        }
+      } finally {
+        this.pendingNvimBufUpdates = Math.max(0, this.pendingNvimBufUpdates - 1);
+        if (this.pendingNvimBufUpdates === 0 && this.pendingVisualRefresh) {
+          this.pendingVisualRefresh = false;
+          this.scheduleVisualSelectionRefresh();
         }
       }
       if (this.bufHandle != null && id === this.bufHandle && isVisualMode(this.lastMode)) this.scheduleVisualSelectionRefresh();
@@ -2609,6 +2613,31 @@ export class MonacoNeovimClient {
           this.pendingKeysAfterExit += key;
         } else {
           this.sendInput(key);
+          this.scheduleCursorRefresh();
+          if (isVisualMode(this.lastMode)) this.scheduleVisualSelectionRefresh();
+        }
+        return;
+      }
+      if (
+        !insertMode
+        && !this.exitingInsertMode
+        && (
+          e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "ArrowUp" || e.key === "ArrowDown"
+          || e.key === "Home" || e.key === "End" || e.key === "PageUp" || e.key === "PageDown"
+        )
+      ) {
+        if (!this.opts.shouldHandleKey(e)) return;
+        const key = this.opts.translateKey(e);
+        if (!key) return;
+        // Prevent Monaco from moving the caret; let Neovim drive cursor/visual selection.
+        stopAll(e);
+        try { e.preventDefault(); } catch (_) {}
+        if (this.exitingInsertMode) {
+          this.pendingKeysAfterExit += key;
+        } else {
+          this.sendInput(key);
+          this.scheduleCursorRefresh();
+          if (isVisualMode(this.lastMode)) this.scheduleVisualSelectionRefresh();
         }
         return;
       }
@@ -2663,6 +2692,10 @@ export class MonacoNeovimClient {
           if (insertMode) this.flushPendingMonacoSync();
           this.debugLog(`keydown(capture) send: key=${JSON.stringify(e.key)} code=${JSON.stringify(e.code)} mods=${e.ctrlKey ? "C" : ""}${e.altKey ? "A" : ""}${e.metaKey ? "D" : ""}${e.shiftKey ? "S" : ""} -> ${key}`);
           this.sendInput(key);
+          if (!insertMode) {
+            this.scheduleCursorRefresh();
+            if (isVisualMode(this.lastMode)) this.scheduleVisualSelectionRefresh();
+          }
         }
       }
     };
@@ -3027,176 +3060,26 @@ export class MonacoNeovimClient {
     }
   }
 
-  private ensureVisualStyle(): void {
-    if (!this.visualStyleEl) {
-      const el = document.createElement("style");
-      el.id = `monaco-neovim-wasm-visual-style-${this.instanceId}`;
-      el.textContent = `
-.${this.instanceClassName} .monaco-neovim-visual-line {
-  background-color: ${this.visualBgCss};
-}
-.${this.instanceClassName} .monaco-neovim-visual-inline {
-  background-color: ${this.visualBgCss};
-}
-.${this.instanceClassName} .monaco-neovim-visual-virtual {
-  position: absolute;
-  background-color: ${this.visualBgCss};
-  pointer-events: none;
-}
-`;
-      document.head.appendChild(el);
-      this.visualStyleEl = el;
-    }
-  }
-
-  private setVisualBgCss(bg: string): void {
-    const next = bg || this.visualBgCss;
-    if (next === this.visualBgCss && this.visualStyleEl) return;
-    this.visualBgCss = next;
-    if (this.visualStyleEl) {
-      this.visualStyleEl.textContent = `
-.${this.instanceClassName} .monaco-neovim-visual-line {
-  background-color: ${this.visualBgCss};
-}
-.${this.instanceClassName} .monaco-neovim-visual-inline {
-  background-color: ${this.visualBgCss};
-}
-.${this.instanceClassName} .monaco-neovim-visual-virtual {
-  position: absolute;
-  background-color: ${this.visualBgCss};
-  pointer-events: none;
-}
-`;
-    }
-  }
-
-  private ensureVisualVirtualOverlay(): HTMLDivElement | null {
-    if (this.visualVirtualOverlayEl && this.visualVirtualOverlayEl.isConnected) return this.visualVirtualOverlayEl;
-    const root = this.editor.getDomNode();
-    if (!root) return null;
-    const host =
-      (root.querySelector(".lines-content .view-overlays") as HTMLElement | null)
-      ?? (root.querySelector(".view-overlays") as HTMLElement | null)
-      ?? root;
-    const el = document.createElement("div");
-    el.id = `monaco-neovim-wasm-visual-virtual-overlay-${this.instanceId}`;
-    el.style.position = "absolute";
-    el.style.left = "0";
-    el.style.top = "0";
-    el.style.width = "100%";
-    el.style.height = "100%";
-    el.style.pointerEvents = "none";
-    // Attach under Monaco's overlay layer so the highlight doesn't visually
-    // "wash out" foreground text (closer to VS Code / Monaco selection).
-    host.appendChild(el);
-    this.visualVirtualOverlayEl = el;
-    return el;
-  }
-
-  private clearVisualVirtualOverlay(): void {
-    this.visualVirtualActive = false;
-    this.visualVirtualRawRanges = [];
-    if (this.visualVirtualOverlayEl) {
-      try { this.visualVirtualOverlayEl.replaceChildren(); } catch (_) {}
-    }
-  }
-
-  private renderVisualVirtualOverlay(): void {
-    if (!this.visualVirtualActive) return;
-    const overlay = this.ensureVisualVirtualOverlay();
-    if (!overlay) return;
-    const model = this.editor.getModel();
-    if (!model) {
-      try { overlay.replaceChildren(); } catch (_) {}
-      return;
-    }
-    const root = this.editor.getDomNode();
-    let offsetX = 0;
-    let offsetY = 0;
-    if (root && overlay !== root) {
-      try {
-        const rootRect = root.getBoundingClientRect();
-        const overlayRect = overlay.getBoundingClientRect();
-        offsetX = Number.isFinite(overlayRect.left - rootRect.left) ? (overlayRect.left - rootRect.left) : 0;
-        offsetY = Number.isFinite(overlayRect.top - rootRect.top) ? (overlayRect.top - rootRect.top) : 0;
-      } catch (_) {
-      }
-    }
-    const rawRanges = Array.isArray(this.visualVirtualRawRanges) ? this.visualVirtualRawRanges : [];
-    if (rawRanges.length === 0) {
-      try { overlay.replaceChildren(); } catch (_) {}
-      return;
-    }
-
-    const fontInfo = this.editor.getOption(monaco.editor.EditorOption.fontInfo) as any;
-    const charWidth = Math.max(1, Number(fontInfo?.typicalHalfwidthCharacterWidth ?? fontInfo?.maxDigitWidth ?? 0) || 0);
-
-    const frag = document.createDocumentFragment();
-    for (const r of rawRanges) {
-      const l0 = Number(r?.start?.line);
-      const startVcol = Number(r?.start_vcol);
-      const endVcol = Number(r?.end_vcol);
-      const disp = Number(r?.disp);
-      if (!Number.isFinite(l0)
-        || !Number.isFinite(startVcol)
-        || !Number.isFinite(endVcol)
-        || !Number.isFinite(disp)) continue;
-      const lineNumber = l0 + 1;
-      if (lineNumber < 1 || lineNumber > model.getLineCount()) continue;
-
-      const leftVcol = Math.min(startVcol, endVcol);
-      const rightVcol = Math.max(startVcol, endVcol);
-
-      const visCol1 = this.editor.getScrolledVisiblePosition(new monaco.Position(lineNumber, 1));
-      if (!visCol1) continue;
-
-      const widthCols = rightVcol - leftVcol + 1;
-      if (widthCols <= 0) continue;
-      const xStart = visCol1.left + Math.max(0, leftVcol - 1) * charWidth;
-      const w = widthCols * charWidth;
-      if (!Number.isFinite(w) || w <= 0) continue;
-
-      const el = document.createElement("div");
-      el.className = "monaco-neovim-visual-virtual";
-      // If the overlay container isn't the editor root (e.g. attached under
-      // Monaco's `.view-overlays`), adjust for its coordinate origin.
-      el.style.left = `${Math.max(0, xStart - offsetX)}px`;
-      el.style.top = `${Math.max(0, visCol1.top - offsetY)}px`;
-      el.style.width = `${w}px`;
-      el.style.height = `${Math.max(0, visCol1.height)}px`;
-      frag.appendChild(el);
-    }
-    try { overlay.replaceChildren(frag); } catch (_) {}
-  }
-
-  private clearVisualDecorations(): void {
-    this.clearVisualVirtualOverlay();
-    if (!this.visualDecorationIds.length) {
-      this.visualSelectionActive = false;
-      return;
-    }
-    try {
-      this.visualDecorationIds = this.editor.deltaDecorations(this.visualDecorationIds, []);
-    } catch (_) {
-      this.visualDecorationIds = [];
-    }
+  private clearVisualSelection(): void {
     this.visualSelectionActive = false;
-  }
-
-  private ensureSearchStyle(): void {
-    if (this.searchStyleEl) return;
-    const el = document.createElement("style");
-    el.id = `monaco-neovim-wasm-search-style-${this.instanceId}`;
-    el.textContent = `
-.${this.instanceClassName} .monaco-neovim-search-match {
-  background-color: ${this.opts.searchMatchBg};
-}
-.${this.instanceClassName} .monaco-neovim-search-current {
-  background-color: ${this.opts.searchCurrentBg};
-}
-`;
-    document.head.appendChild(el);
-    this.searchStyleEl = el;
+    this.pendingVisualSelections = null;
+    if (this.selectionRenderFrame != null && typeof window !== "undefined") {
+      window.cancelAnimationFrame(this.selectionRenderFrame);
+      this.selectionRenderFrame = null;
+    }
+    if (this.compositionActive) return;
+    const pos = this.editor.getPosition();
+    if (!pos) return;
+    const next = [new monaco.Selection(pos.lineNumber, pos.column, pos.lineNumber, pos.column)];
+    const prev = this.editor.getSelections();
+    if (selectionsEqual(prev, next)) return;
+    try {
+      this.suppressCursorSync = true;
+      this.editor.setSelections(next);
+    } catch (_) {
+    } finally {
+      this.suppressCursorSync = false;
+    }
   }
 
   private clearSearchHighlights(): void {
@@ -3205,6 +3088,46 @@ export class MonacoNeovimClient {
       this.searchDecorationIds = this.editor.deltaDecorations(this.searchDecorationIds, []);
     } catch (_) {
       this.searchDecorationIds = [];
+    }
+  }
+
+  private scheduleSelectionRender(): void {
+    if (typeof window === "undefined") return;
+    if (this.selectionRenderFrame != null) return;
+    this.selectionRenderFrame = window.requestAnimationFrame(() => {
+      this.selectionRenderFrame = null;
+      if (!isVisualMode(this.lastMode)) return;
+      const pending = this.pendingVisualSelections;
+      if (!pending || this.compositionActive) return;
+      try {
+        this.editor.setSelections(pending);
+        this.editor.render();
+      } catch (_) {
+      }
+    });
+  }
+
+  private ensureSelectionVisible(selections: monaco.Selection[]): void {
+    if (!selections.length) return;
+    let visibleRanges: monaco.Range[] = [];
+    try {
+      visibleRanges = this.editor.getVisibleRanges();
+    } catch (_) {
+      visibleRanges = [];
+    }
+    if (!visibleRanges.length) return;
+    const primary = selections[0];
+    if (!primary) return;
+    const range = monaco.Range.fromPositions(primary.getStartPosition(), primary.getEndPosition());
+    const isVisible = visibleRanges.some((vr) => {
+      if (range.endLineNumber < vr.startLineNumber) return false;
+      if (range.startLineNumber > vr.endLineNumber) return false;
+      return true;
+    });
+    if (isVisible) return;
+    try {
+      this.editor.revealRangeInCenterIfOutsideViewport(range);
+    } catch (_) {
     }
   }
 
@@ -3290,14 +3213,15 @@ export class MonacoNeovimClient {
       const endCol = byteIndexToCharIndex(text, Math.max(0, e0)) + 1;
       if (endCol <= startCol) continue;
       const key = `${l0}:${s0}:${e0}`;
-      const className = (currentKey && key === currentKey) ? "monaco-neovim-search-current" : "monaco-neovim-search-match";
+      const isCurrent = Boolean(currentKey && key === currentKey);
+      const className = isCurrent ? "currentFindMatch" : "findMatch";
+      const inlineClassName = isCurrent ? "currentFindMatchInline" : "findMatchInline";
       decorations.push({
         range: new monaco.Range(lineNumber, startCol, lineNumber, endCol),
-        options: { inlineClassName: className },
+        options: { className, inlineClassName },
       });
     }
 
-    this.ensureSearchStyle();
     try {
       this.searchDecorationIds = this.editor.deltaDecorations(this.searchDecorationIds, decorations);
     } catch (_) {
@@ -3305,75 +3229,41 @@ export class MonacoNeovimClient {
     }
   }
 
-  private applyVisualDecorations(
-    selections: monaco.Selection[],
-    mode: string,
-    rawRanges: any[] = [],
-    modeTailOverride = "",
-  ): void {
-    this.ensureVisualStyle();
-    const tail = (typeof modeTailOverride === "string" && modeTailOverride) ? modeTailOverride : getModeTail(mode);
-    const isLinewise = tail === "V";
-    const isBlockwise = tail === "\u0016";
-    const decorations: monaco.editor.IModelDeltaDecoration[] = [];
-    if (isLinewise) {
-      let minLine = Infinity;
-      let maxLine = -Infinity;
-      for (const sel of selections) {
-        const a = sel.getStartPosition();
-        const b = sel.getEndPosition();
-        minLine = Math.min(minLine, a.lineNumber, b.lineNumber);
-        maxLine = Math.max(maxLine, a.lineNumber, b.lineNumber);
-      }
-      if (Number.isFinite(minLine) && Number.isFinite(maxLine) && maxLine >= minLine) {
-        decorations.push({
-          range: new monaco.Range(minLine, 1, maxLine, 1),
-          options: { isWholeLine: true, className: "monaco-neovim-visual-line" },
-        });
-      }
-    } else if (!isBlockwise) {
-      for (const sel of selections) {
-        const a = sel.getStartPosition();
-        const b = sel.getEndPosition();
-        decorations.push({
-          range: monaco.Range.fromPositions(a, b),
-          options: { className: "monaco-neovim-visual-inline" },
-        });
-      }
+  private applyVisualSelection(selections: monaco.Selection[]): void {
+    if (!selections.length) {
+      this.visualSelectionActive = false;
+      return;
     }
-
-    if (isBlockwise) {
-      this.visualVirtualRawRanges = Array.isArray(rawRanges) ? rawRanges : [];
-      this.visualVirtualActive = true;
-      this.renderVisualVirtualOverlay();
-    } else {
-      this.clearVisualVirtualOverlay();
+    if (this.compositionActive) return;
+    const prev = this.editor.getSelections();
+    const hasSelection = selections.some(
+      (sel) => sel.selectionStartLineNumber !== sel.positionLineNumber
+        || sel.selectionStartColumn !== sel.positionColumn,
+    );
+    if (selectionsEqual(prev, selections)) {
+      this.visualSelectionActive = hasSelection;
+      this.ensureSelectionVisible(selections);
+      if (hasSelection) {
+        this.pendingVisualSelections = selections;
+        this.scheduleSelectionRender();
+      }
+      if (hasSelection) this.lastVisualSelectionAt = this.nowMs();
+      return;
     }
     try {
-      this.visualDecorationIds = this.editor.deltaDecorations(this.visualDecorationIds, decorations);
-      this.visualSelectionActive = decorations.length > 0 || isBlockwise;
-    } catch (_) {
-      this.visualDecorationIds = [];
-      this.visualSelectionActive = false;
-    }
-
-    // Keep Monaco's own selection collapsed so it doesn't visually compete with
-    // Neovim's visual-mode highlights (especially in visual-block mode where we
-    // use a DOM overlay instead of model decorations).
-    if (this.visualSelectionActive && !this.compositionActive) {
-      // Only collapse using Monaco's *current* cursor position. Using a cached
-      // lastCursorPos here can jump the cursor when entering visual mode (mode
-      // events can arrive before cursor events).
-      const pos = this.editor.getPosition();
-      if (pos) {
-        try {
-          this.suppressCursorSync = true;
-          this.editor.setSelection(new monaco.Selection(pos.lineNumber, pos.column, pos.lineNumber, pos.column));
-        } catch (_) {
-        } finally {
-          this.suppressCursorSync = false;
-        }
+      this.suppressCursorSync = true;
+      this.editor.setSelections(selections);
+      this.visualSelectionActive = hasSelection;
+      this.ensureSelectionVisible(selections);
+      if (hasSelection) {
+        this.pendingVisualSelections = selections;
+        this.scheduleSelectionRender();
       }
+      if (hasSelection) this.lastVisualSelectionAt = this.nowMs();
+    } catch (_) {
+      this.visualSelectionActive = false;
+    } finally {
+      this.suppressCursorSync = false;
     }
   }
 
@@ -3387,7 +3277,7 @@ export class MonacoNeovimClient {
     if (modeChanged) {
       this.lastMode = m;
       if (isCmdlineLike(m)) this.ignoreNextInputEvent = false;
-      this.setMonacoHighlightsSuppressed(isVisualMode(m));
+      this.setMonacoHighlightsSuppressed(false);
     }
     this.nvimBlocking = nextBlocking;
 
@@ -3461,7 +3351,7 @@ export class MonacoNeovimClient {
     }
     if (modeChanged && isVisualMode(prevMode) && !isVisualMode(m)) {
       // Monaco selection can persist even after leaving visual mode; clear it to
-      // avoid Monaco-only deletes (e.g. Backspace) and rely on decorations instead.
+      // avoid Monaco-only deletes (e.g. Backspace).
       try {
         const pos = this.editor.getPosition() ?? this.lastCursorPos;
         if (pos && !this.compositionActive) {
@@ -3803,6 +3693,8 @@ vim.opt.ei = ei
       this.recentNormalKeys = (this.recentNormalKeys + key).slice(-16);
     }
     this.sendInput(key);
+    if (!this.delegateInsertToMonaco) this.scheduleCursorRefresh();
+    if (isVisualMode(this.lastMode)) this.scheduleVisualSelectionRefresh();
   }
 
   private handleMouse(ev: monaco.editor.IEditorMouseEvent): void {
@@ -4148,6 +4040,11 @@ api.nvim_win_set_cursor(0, { b_line, b_col0 })
   }
 
   private scheduleVisualSelectionRefresh(): void {
+    if (!isVisualMode(this.lastMode)) return;
+    if (this.pendingNvimBufUpdates > 0) {
+      this.pendingVisualRefresh = true;
+      return;
+    }
     if (this.visualSelectionRefreshTimer) return;
     this.visualSelectionRefreshTimer = window.setTimeout(() => {
       this.visualSelectionRefreshTimer = null;
@@ -4197,9 +4094,22 @@ if ${clipboard} then
   pcall(setup_clipboard)
 end
 
-local function send_cursor()
+local last_cursor = { line = nil, col = nil }
+local cursor_timer = nil
+local function flush_cursor()
+  cursor_timer = nil
   local cur = api.nvim_win_get_cursor(0)
+  if last_cursor.line == cur[1] and last_cursor.col == cur[2] then
+    return
+  end
+  last_cursor.line = cur[1]
+  last_cursor.col = cur[2]
   vim.rpcnotify(chan, "monaco_cursor", cur[1], cur[2])
+end
+
+local function send_cursor()
+  if cursor_timer then return end
+  cursor_timer = vim.defer_fn(flush_cursor, 5)
 end
 
 local function send_mode()
@@ -4231,6 +4141,43 @@ if ${hostCommands} then
 end
 
 local group = api.nvim_create_augroup("MonacoNeovimWasm", { clear = true })
+local function setup_visual_changed()
+  local ok = pcall(function()
+    local visual_ns = api.nvim_create_namespace("monaco.visual.changed")
+    local is_visual, last_visual_pos, last_curr_pos
+    local function fire_visual_changed()
+      vim.rpcnotify(chan, "monaco_visual_changed")
+    end
+    api.nvim_create_autocmd({ "ModeChanged" }, {
+      group = group,
+      callback = function(ev)
+        local mode = api.nvim_get_mode().mode
+        is_visual = mode:match("[vV\\022]")
+        if ev.match:match("[vV\\022]") then
+          last_visual_pos = fn.getpos("v")
+          last_curr_pos = fn.getpos(".")
+          fire_visual_changed()
+        end
+      end,
+    })
+    api.nvim_set_decoration_provider(visual_ns, {
+      on_win = function()
+        if is_visual then
+          local visual_pos = fn.getpos("v")
+          local curr_pos = fn.getpos(".")
+          if not (vim.deep_equal(visual_pos, last_visual_pos) and vim.deep_equal(curr_pos, last_curr_pos)) then
+            last_visual_pos = visual_pos
+            last_curr_pos = curr_pos
+            fire_visual_changed()
+          end
+        end
+      end,
+    })
+  end)
+  if not ok then
+    return
+  end
+end
 api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
   group = group,
   callback = function() send_cursor() end,
@@ -4272,6 +4219,7 @@ api.nvim_create_autocmd({ "BufDelete" }, {
   end,
 })
 
+setup_visual_changed()
 send_mode()
 send_cursor()
 send_scrolloff()
@@ -4541,16 +4489,99 @@ vim.rpcnotify(chan, "monaco_buf_enter", {
     const current = this.editor.getPosition();
     const same = current && current.lineNumber === validated.lineNumber && current.column === validated.column;
     if (!same) {
+      const keepSelection = this.visualSelectionActive
+        || (this.lastVisualSelectionAt && (this.nowMs() - this.lastVisualSelectionAt) < 120);
+      if (isVisualMode(this.lastMode) || keepSelection) {
+        const applied = this.applyScrolloff(this.lastCursorPos);
+        if (!applied) this.editor.revealPositionInCenterIfOutsideViewport(this.lastCursorPos);
+        this.requestSearchHighlightRefresh();
+        return;
+      }
       this.suppressCursorSync = true;
       this.editor.setPosition(this.lastCursorPos);
-      if (this.visualSelectionActive) {
-        this.editor.setSelection(new monaco.Selection(validated.lineNumber, validated.column, validated.lineNumber, validated.column));
-      }
       const applied = this.applyScrolloff(this.lastCursorPos);
       if (!applied) this.editor.revealPositionInCenterIfOutsideViewport(this.lastCursorPos);
       this.suppressCursorSync = false;
     }
     this.requestSearchHighlightRefresh();
+  }
+
+  private async applyCursorSelectionFromNvim(lineNumber: number, column: number): Promise<void> {
+    const model = this.editor.getModel();
+    const ln = Math.max(1, Number(lineNumber) || 1);
+    const cl = Math.max(1, Number(column) || 1);
+    const validated = model
+      ? model.validatePosition(new monaco.Position(ln, cl))
+      : new monaco.Position(ln, cl);
+    this.lastCursorPos = validated;
+    if (this.compositionActive) return;
+
+    const visual = isVisualMode(this.lastMode);
+    if (visual && this.pendingNvimBufUpdates > 0) {
+      this.pendingVisualRefresh = true;
+      return;
+    }
+
+    let selections: monaco.Selection[] = [];
+    if (visual) {
+      const token = ++this.visualSelectionToken;
+      try {
+        selections = await this.fetchVisualRanges();
+      } catch (err) {
+        const msg = (err as { message?: string })?.message ?? String(err);
+        this.debugLog(`visual selection failed: ${msg}`);
+        return;
+      }
+      if (token !== this.visualSelectionToken) return;
+      if (!selections.length) {
+        this.clearVisualSelection();
+        return;
+      }
+    } else {
+      selections = [new monaco.Selection(validated.lineNumber, validated.column, validated.lineNumber, validated.column)];
+    }
+
+    const prev = this.editor.getSelections();
+    const hasSelection = selections.some(
+      (sel) => sel.selectionStartLineNumber !== sel.positionLineNumber
+        || sel.selectionStartColumn !== sel.positionColumn,
+    );
+    if (!selectionsEqual(prev, selections)) {
+      try {
+        this.suppressCursorSync = true;
+        this.editor.setSelections(selections);
+      } catch (_) {
+      } finally {
+        this.suppressCursorSync = false;
+      }
+    }
+
+    if (visual) {
+      this.visualSelectionActive = hasSelection;
+      this.ensureSelectionVisible(selections);
+      if (hasSelection) {
+        this.lastVisualSelectionAt = this.nowMs();
+        this.pendingVisualSelections = selections;
+        this.scheduleSelectionRender();
+      }
+    } else {
+      this.visualSelectionActive = false;
+      const applied = this.applyScrolloff(validated);
+      if (!applied) this.editor.revealPositionInCenterIfOutsideViewport(validated);
+    }
+    this.requestSearchHighlightRefresh();
+  }
+
+  private scheduleCursorUpdate(lineNumber: number, column: number): void {
+    this.pendingCursorUpdate = { line: lineNumber, col: column };
+    if (this.cursorUpdateTimer) return;
+    this.cursorUpdateTimer = window.setTimeout(() => {
+      this.cursorUpdateTimer = null;
+      const pending = this.pendingCursorUpdate;
+      this.pendingCursorUpdate = null;
+      if (!pending) return;
+      void this.applyCursorSelectionFromNvim(pending.line, pending.col);
+    }, 5);
   }
 
   private requestSearchHighlightRefresh(): void {
@@ -4605,13 +4636,13 @@ vim.rpcnotify(chan, "monaco_buf_enter", {
             this.optimisticCursorPos = null;
             this.optimisticCursorPrevPos = null;
             this.optimisticCursorUntil = 0;
-            this.updateCursor(next.lineNumber, next.column);
+            await this.applyCursorSelectionFromNvim(next.lineNumber, next.column);
           }
         } else {
           this.optimisticCursorPos = null;
           this.optimisticCursorPrevPos = null;
           this.optimisticCursorUntil = 0;
-          this.updateCursor(next.lineNumber, next.column);
+          await this.applyCursorSelectionFromNvim(next.lineNumber, next.column);
         }
       }
       if (!this.lastMode) {
@@ -4640,10 +4671,15 @@ vim.rpcnotify(chan, "monaco_buf_enter", {
 
   private applyCursorStyle(mode: string): void {
     const m = typeof mode === "string" ? mode : "";
+    const isVisual = isVisualMode(m);
     const isInsert = m.startsWith("i") || m.startsWith("R");
-    const style: MonacoEditor.IStandaloneEditorConstructionOptions["cursorStyle"] = isInsert ? "line" : "block";
+    const style: MonacoEditor.IStandaloneEditorConstructionOptions["cursorStyle"] = isVisual
+      ? "line-thin"
+      : (isInsert ? "line" : "block");
     const blink: MonacoEditor.IStandaloneEditorConstructionOptions["cursorBlinking"] = isInsert ? "blink" : "solid";
-    const width = isInsert ? (this.initialCursorWidth || 1) : this.typicalFullWidth;
+    const width = isVisual
+      ? 1
+      : (isInsert ? (this.initialCursorWidth || 1) : this.typicalFullWidth);
     if (style === this.lastCursorStyle && blink === this.lastCursorBlink && width === this.lastCursorWidth) return;
     this.editor.updateOptions({ cursorStyle: style, cursorBlinking: blink, cursorWidth: width });
     this.lastCursorStyle = style;
@@ -4653,75 +4689,78 @@ vim.rpcnotify(chan, "monaco_buf_enter", {
 
   private async updateVisualSelection(mode: string): Promise<void> {
     const visual = isVisualMode(mode);
-    const token = ++this.visualSelectionToken;
-    if (!visual) {
-      this.clearVisualDecorations();
-      return;
+    if (!visual && this.session && this.session.isRunning()) {
+      const now = this.nowMs();
+      if (now >= this.visualModeCheckUntil) {
+        this.visualModeCheckUntil = now + 80;
+        try {
+          const info = await this.rpcCall("nvim_get_mode", []);
+          const m = info && typeof (info as { mode?: string }).mode === "string" ? String((info as { mode: string }).mode) : "";
+          if (m && m !== this.lastMode) {
+            this.lastMode = m;
+            this.applyCursorStyle(m);
+            if (this.opts.onModeChange) this.opts.onModeChange(m);
+          }
+        } catch (_) {
+        }
+      }
     }
+    if (!visual) return;
+    const token = ++this.visualSelectionToken;
     try {
-      const { selections, raw, tail } = await this.fetchVisualRanges();
+      const selections = await this.fetchVisualRanges();
       if (token !== this.visualSelectionToken) return;
-      if (!selections.length) return;
-      this.applyVisualDecorations(selections, mode, raw, tail);
-    } catch (_) {
+      if (!selections.length) {
+        this.clearVisualSelection();
+        return;
+      }
+      this.applyVisualSelection(selections);
+    } catch (err) {
+      const msg = (err as { message?: string })?.message ?? String(err);
+      this.debugLog(`visual selection failed: ${msg}`);
     }
   }
 
-  private async fetchVisualRanges(): Promise<{ selections: monaco.Selection[]; raw: any[]; tail: string }> {
+  private async fetchVisualRanges(): Promise<monaco.Selection[]> {
     const res = await this.execLua(VISUAL_SELECTION_LUA, []);
     let raw: any[] = [];
-    let tail = "";
     if (Array.isArray(res)) {
       raw = res as any[];
     } else if (res && typeof res === "object") {
       const obj = res as any;
-      tail = typeof obj.tail === "string" ? obj.tail : "";
-      raw = Array.isArray(obj.ranges) ? obj.ranges : [];
+      if (Array.isArray(obj.ranges)) {
+        raw = obj.ranges;
+      } else if (obj.start && obj.end) {
+        raw = [obj];
+      } else {
+        const numeric = Object.keys(obj)
+          .filter((k) => /^\d+$/.test(k))
+          .sort((a, b) => Number(a) - Number(b));
+        if (numeric.length) {
+          raw = numeric.map((k) => obj[k]);
+        } else {
+          raw = [];
+        }
+      }
+    }
+    if (this.opts.debug) {
+      let sample = "none";
+      if (raw.length) {
+        try { sample = JSON.stringify(raw[0]); } catch (_) { sample = "[unserializable]"; }
+      }
+      this.debugLog(`visual ranges raw=${raw.length} sample=${sample}`);
     }
     const selections = raw
-      .map(byteRangeToSelection(this.editor))
+      .map(lspRangeToSelection(this.editor))
       .filter((s): s is monaco.Selection => Boolean(s));
-    return { selections, raw, tail };
+    if (this.opts.debug) {
+      this.debugLog(`visual selections=${selections.length} ${formatSelections(selections)}`);
+    }
+    return selections;
   }
 
   private async syncVisualSelectionColor(): Promise<void> {
-    try {
-      if (this.opts.visualSelectionBg) {
-        const main = this.opts.visualSelectionBg;
-        if (this.opts.applyVisualTheme) {
-          monaco.editor.defineTheme(this.opts.visualThemeName, {
-            base: "vs-dark",
-            inherit: true,
-            rules: [],
-            colors: {
-              "editor.selectionBackground": main,
-              "editor.selectionHighlightBackground": main,
-            },
-          });
-          this.editor.updateOptions({ theme: this.opts.visualThemeName });
-        }
-        this.setVisualBgCss(main);
-        return;
-      }
-      const hex = await this.fetchVisualBg();
-      const base = hex || "#3e4451";
-      const main = withAlpha(base, 0.45);
-      const highlight = withAlpha(base, 0.3);
-      if (this.opts.applyVisualTheme) {
-        monaco.editor.defineTheme(this.opts.visualThemeName, {
-          base: "vs-dark",
-          inherit: true,
-          rules: [],
-          colors: {
-            "editor.selectionBackground": main,
-            "editor.selectionHighlightBackground": highlight,
-          },
-        });
-        this.editor.updateOptions({ theme: this.opts.visualThemeName });
-      }
-      this.setVisualBgCss(main);
-    } catch (_) {
-    }
+    return;
   }
 
   private setMonacoHighlightsSuppressed(suppress: boolean): void {
@@ -4731,15 +4770,11 @@ vim.rpcnotify(chan, "monaco_buf_enter", {
     if (next) {
       try {
         this.monacoPrevOccurrencesHighlight = this.editor.getOption(EditorOption.occurrencesHighlight) as any;
-        this.monacoPrevSelectionHighlight = this.editor.getOption(EditorOption.selectionHighlight) as any;
-        this.monacoPrevSelectionHighlightMultiline = this.editor.getOption(EditorOption.selectionHighlightMultiline) as any;
       } catch (_) {
       }
       try {
         this.editor.updateOptions({
           occurrencesHighlight: "off" as any,
-          selectionHighlight: false,
-          selectionHighlightMultiline: false,
         } as any);
         this.monacoHighlightsSuppressed = true;
       } catch (_) {
@@ -4749,31 +4784,11 @@ vim.rpcnotify(chan, "monaco_buf_enter", {
     try {
       this.editor.updateOptions({
         occurrencesHighlight: (this.monacoPrevOccurrencesHighlight ?? "singleFile") as any,
-        selectionHighlight: this.monacoPrevSelectionHighlight ?? true,
-        selectionHighlightMultiline: this.monacoPrevSelectionHighlightMultiline ?? true,
       } as any);
     } catch (_) {
     }
     this.monacoHighlightsSuppressed = false;
     this.monacoPrevOccurrencesHighlight = null;
-    this.monacoPrevSelectionHighlight = null;
-    this.monacoPrevSelectionHighlightMultiline = null;
-  }
-
-  private async fetchVisualBg(): Promise<string | null> {
-    try {
-      const hl = await this.rpcCall("nvim_get_hl", [0, { name: "Visual", link: false }]);
-      const bg = normalizeHlBg(hl);
-      if (bg) return bg;
-    } catch (_) {
-    }
-    try {
-      const hl = await this.rpcCall("nvim_get_hl_by_name", ["Visual", true]);
-      const bg = normalizeHlBg(hl);
-      if (bg) return bg;
-    } catch (_) {
-    }
-    return null;
   }
 
   private async seedBuffer(bufHandle: number, seedOverride?: string[] | null): Promise<string[] | null> {
@@ -4925,6 +4940,42 @@ function translateKey(ev: KeyboardEvent): string | null {
   return null;
 }
 
+function selectionsEqual(
+  a: readonly monaco.Selection[] | null | undefined,
+  b: readonly monaco.Selection[] | null | undefined,
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    const sa = a[i];
+    const sb = b[i];
+    if (!sa || !sb) return false;
+    if (
+      sa.selectionStartLineNumber !== sb.selectionStartLineNumber
+      || sa.selectionStartColumn !== sb.selectionStartColumn
+      || sa.positionLineNumber !== sb.positionLineNumber
+      || sa.positionColumn !== sb.positionColumn
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function formatSelections(selections: readonly monaco.Selection[] | null | undefined): string {
+  if (!selections || selections.length === 0) return "[]";
+  return selections
+    .map((sel) => {
+      const sLine = sel.selectionStartLineNumber;
+      const sCol = sel.selectionStartColumn;
+      const eLine = sel.positionLineNumber;
+      const eCol = sel.positionColumn;
+      return `[${sLine},${sCol} -> ${eLine},${eCol}]`;
+    })
+    .join(" ");
+}
+
 function decodeHandleId(data: Uint8Array): number | null {
   if (!data || data.length === 0) return null;
   const t = data[0];
@@ -5008,42 +5059,87 @@ function utf8ByteLength(point: number): number {
   return 4;
 }
 
-function byteRangeToSelection(editor: MonacoEditor.IStandaloneCodeEditor) {
+function lspRangeToSelection(editor: MonacoEditor.IStandaloneCodeEditor) {
   return (range: any) => {
     if (!range || !range.start || !range.end) return null;
-    const start = toMonacoBytePos(editor, range.start, false);
-    const end = toMonacoBytePos(editor, range.end, !!range.inclusive);
+    const model = editor.getModel();
+    const startPos = parseLspPosition(range.start);
+    const endPos = parseLspPosition(range.end);
+    if (!startPos || !endPos) return null;
+    const start = toMonacoLspPos(model, startPos);
+    const end = toMonacoLspPos(model, endPos);
     if (!start || !end) return null;
-    return new monaco.Selection(start.lineNumber, start.column, end.lineNumber, end.column);
+    const reversed = compareLspPositions(startPos, endPos) > 0;
+    let rangeObj = new monaco.Range(
+      start.lineNumber,
+      start.column,
+      end.lineNumber,
+      end.column,
+    );
+    if (model) {
+      rangeObj = model.validateRange(rangeObj);
+    }
+    const rangeStart = rangeObj.getStartPosition();
+    const rangeEnd = rangeObj.getEndPosition();
+    if (reversed && (rangeStart.lineNumber !== rangeEnd.lineNumber || rangeStart.column !== rangeEnd.column)) {
+      return new monaco.Selection(
+        rangeEnd.lineNumber,
+        rangeEnd.column,
+        rangeStart.lineNumber,
+        rangeStart.column,
+      );
+    }
+    return new monaco.Selection(
+      rangeStart.lineNumber,
+      rangeStart.column,
+      rangeEnd.lineNumber,
+      rangeEnd.column,
+    );
   };
 }
 
-function toMonacoBytePos(
-  editor: MonacoEditor.IStandaloneCodeEditor,
-  pos: { line?: number; col?: number },
-  inclusiveEnd: boolean,
-) {
-  if (!pos || typeof pos.line !== "number" || typeof pos.col !== "number") return null;
-  const model = editor.getModel();
-  const lineNumber = clamp(pos.line + 1, 1, model?.getLineCount() || Infinity);
-  if (!model) {
-    const baseCol = Math.max(1, pos.col + 1);
-    return { lineNumber, column: baseCol + (inclusiveEnd ? 1 : 0) };
+function parseLspPosition(pos: any): { line: number; character: number } | null {
+  if (!pos) return null;
+  if (typeof pos.line === "number" && typeof pos.character === "number") {
+    if (!Number.isFinite(pos.line) || !Number.isFinite(pos.character)) return null;
+    return { line: pos.line, character: pos.character };
   }
-  const text = model.getLineContent(lineNumber) ?? "";
-  const byte = Math.max(0, Number(pos.col) || 0);
-  let endByte = byte;
-  if (inclusiveEnd) {
-    const charIndex = byteIndexToCharIndex(text, byte);
-    if (charIndex < text.length) {
-      const cp = text.codePointAt(charIndex);
-      endByte = byte + utf8ByteLength(cp ?? 0);
-    }
+  if (Array.isArray(pos) && pos.length >= 2) {
+    const line = Number(pos[0]);
+    const character = Number(pos[1]);
+    if (!Number.isFinite(line) || !Number.isFinite(character)) return null;
+    return { line, character };
   }
-  const column = byteIndexToCharIndex(text, endByte) + 1;
-  const maxColumn = model.getLineMaxColumn(lineNumber);
-  return { lineNumber, column: clamp(column, 1, maxColumn) };
+  return null;
 }
+
+function toMonacoLspPos(
+  model: monaco.editor.ITextModel | null,
+  pos: { line?: number; character?: number },
+) {
+  if (!pos || typeof pos.line !== "number" || typeof pos.character !== "number") return null;
+  if (!Number.isFinite(pos.line) || !Number.isFinite(pos.character)) return null;
+  const lineNumber = Math.max(1, Math.floor(pos.line) + 1);
+  const column = Math.max(1, Math.floor(pos.character) + 1);
+  if (!model) {
+    return { lineNumber, column };
+  }
+  return model.validatePosition(new monaco.Position(lineNumber, column));
+}
+
+function compareLspPositions(
+  a: { line?: number; character?: number },
+  b: { line?: number; character?: number },
+): number {
+  const aLine = Number(a?.line) || 0;
+  const bLine = Number(b?.line) || 0;
+  if (aLine !== bLine) return aLine < bLine ? -1 : 1;
+  const aChar = Number(a?.character) || 0;
+  const bChar = Number(b?.character) || 0;
+  if (aChar === bChar) return 0;
+  return aChar < bChar ? -1 : 1;
+}
+
 
 function isVisualMode(mode: string): boolean {
   const m = typeof mode === "string" ? mode : "";
@@ -5075,34 +5171,6 @@ function mergeSessionFiles(
   return all.length ? all : undefined;
 }
 
-function withAlpha(hex: string, alpha: number): string {
-  const clean = (hex || "").replace("#", "");
-  if (clean.length !== 6) return hex;
-  const a = Math.round(clamp(alpha, 0, 1) * 255);
-  return `#${clean}${a.toString(16).padStart(2, "0")}`;
-}
-
-function normalizeHlBg(hl: unknown): string | null {
-  if (!hl || typeof hl !== "object") return null;
-  const obj = hl as Record<string, unknown>;
-  const num = (obj.background as number | undefined) ?? (obj.bg as number | undefined);
-  if (typeof num === "number" && num >= 0) {
-    return toHex(num);
-  }
-  if (typeof obj.background === "string" && (obj.background as string).startsWith("#")) {
-    return obj.background as string;
-  }
-  if (typeof obj.bg === "string" && (obj.bg as string).startsWith("#")) {
-    return obj.bg as string;
-  }
-  return null;
-}
-
-function toHex(n: number): string {
-  const v = Number(n >>> 0);
-  return `#${v.toString(16).padStart(6, "0").slice(-6)}`;
-}
-
 function domListener<E extends Event>(
   target: EventTarget,
   type: string,
@@ -5119,11 +5187,6 @@ function isInsertLike(mode: string): boolean {
   // Replace mode (`R`) must be handled by Neovim directly; delegating it to
   // Monaco breaks `r{char}` and `R` semantics (replace vs insert).
   return m.startsWith("i");
-}
-
-function getModeTail(mode: string): string {
-  const m = typeof mode === "string" ? mode : "";
-  return m.length ? m[m.length - 1] : "";
 }
 
 function isCmdlineLike(mode: string): boolean {

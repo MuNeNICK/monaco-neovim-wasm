@@ -135,7 +135,6 @@ These features delegate some "screen line / viewport" behavior to Monaco for bet
 ### Search highlights
 
 - `searchHighlights`: render Neovim search highlights as Monaco decorations (visible viewport)
-- `searchMatchBg` / `searchCurrentBg`: customize highlight colors without changing the Monaco theme
 
 ### Clipboard (yank / paste)
 
@@ -158,12 +157,6 @@ Notes:
 ### Multiple buffers
 
 When Neovim switches buffers (`:bnext`, `:buffer`, …), the client swaps Monaco models accordingly.
-
-### Visual selection highlight
-
-- By default, visual selection is drawn via CSS overlays and does not change your Monaco theme.
-- `visualSelectionBg`: override the visual selection background color (CSS string).
-- `applyVisualTheme: true`: additionally apply a Monaco theme override so Monaco's native selection colors match Neovim's `Visual` highlight group.
 
 ## Loading Vimscript overrides
 

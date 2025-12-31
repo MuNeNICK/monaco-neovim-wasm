@@ -1,11 +1,11 @@
 {
   "name": "@monaco-neovim-wasm/wasm-async",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "private": false,
   "type": "module",
   "description": "Batteries-included package: @monaco-neovim-wasm/lib + asyncify nvim.wasm + runtime (postMessage input; no COOP/COEP).",
   "dependencies": {
-    "@monaco-neovim-wasm/lib": "0.1.18"
+    "@monaco-neovim-wasm/lib": "0.1.19"
   },
   "peerDependencies": {
     "monaco-editor": ">=0.44.0 <1.0.0"
