@@ -133,8 +133,11 @@ export function resolveOptions(
     seedMarkModified: options.seedMarkModified ?? false,
     initialSync,
     syncModelFromMonaco,
-    seedName: options.seedName ?? "monaco-demo.lua",
-    seedFiletype: options.seedFiletype ?? "lua",
+    // Important: avoid a non-unique default name/filetype. If callers rely on hostCommands
+    // + fileSystem and run `:w` without an explicit path, a shared default can overwrite
+    // unrelated documents/files.
+    seedName: options.seedName ?? "",
+    seedFiletype: options.seedFiletype ?? "",
     uiAttach: options.uiAttach ?? true,
     uiAttachOptions: {
       ext_cmdline: options.uiAttachOptions?.ext_cmdline ?? true,
@@ -167,4 +170,3 @@ export function resolveOptions(
     translateKey: options.translateKey ?? deps.translateKey,
   };
 }
-

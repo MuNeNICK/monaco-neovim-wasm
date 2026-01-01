@@ -30,6 +30,7 @@ export class OverlayManager {
   private cmdlineCursorContentBytes = 0;
 
   private messageEl: HTMLDivElement | null = null;
+  private messageTextRaw: string | null = null;
   private messageTimer: number | null = null;
 
   private popupEl: HTMLDivElement | null = null;
@@ -52,7 +53,7 @@ export class OverlayManager {
   }
 
   getMessageText(): string {
-    return this.messageEl?.textContent ?? "";
+    return this.messageTextRaw ?? this.messageEl?.textContent ?? "";
   }
 
   setCmdlineCursorMapping(prefixBytes: number, contentBytes: number): void {
@@ -71,79 +72,9 @@ export class OverlayManager {
   initCmdlineUi(): void {
     if (this.cmdlineContainer === null) return;
     if (this.cmdlineEl || this.messageEl || this.popupEl) return;
-    const container = this.cmdlineContainer ?? this.editor.getDomNode();
-    if (!container) return;
-
-    this.ensureRelativePosition(container);
-
-    const baseFont = "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
-    const baseSize = "12px";
-    const baseLine = "1.4";
-
-    if (!this.callbacks.onCmdline) {
-      const el = document.createElement("div");
-      el.style.position = "absolute";
-      el.style.left = "0";
-      el.style.right = "0";
-      el.style.bottom = "0";
-      el.style.padding = "6px 10px";
-      el.style.fontFamily = baseFont;
-      el.style.fontSize = baseSize;
-      el.style.lineHeight = baseLine;
-      el.style.background = "rgba(0, 0, 0, 0.72)";
-      el.style.color = "#ddd";
-      el.style.borderTop = "1px solid rgba(255, 255, 255, 0.08)";
-      el.style.whiteSpace = "pre";
-      el.style.display = "none";
-      el.style.pointerEvents = "none";
-      el.style.zIndex = "20";
-      container.appendChild(el);
-      this.cmdlineEl = el;
-    }
-
-    if (!this.callbacks.onMessage) {
-      const msg = document.createElement("div");
-      msg.style.position = "absolute";
-      msg.style.left = "0";
-      msg.style.right = "0";
-      msg.style.bottom = "34px";
-      msg.style.padding = "6px 10px";
-      msg.style.fontFamily = baseFont;
-      msg.style.fontSize = baseSize;
-      msg.style.lineHeight = baseLine;
-      msg.style.background = "rgba(0, 0, 0, 0.55)";
-      msg.style.color = "#ddd";
-      msg.style.whiteSpace = "pre-wrap";
-      msg.style.display = "none";
-      msg.style.pointerEvents = "none";
-      msg.style.zIndex = "19";
-      container.appendChild(msg);
-      this.messageEl = msg;
-    }
-
-    if (!this.callbacks.onPopupmenu) {
-      const pop = document.createElement("div");
-      pop.style.position = "absolute";
-      pop.style.left = "12px";
-      pop.style.bottom = "34px";
-      pop.style.maxHeight = "40%";
-      pop.style.overflow = "auto";
-      pop.style.minWidth = "240px";
-      pop.style.padding = "4px 0";
-      pop.style.fontFamily = baseFont;
-      pop.style.fontSize = baseSize;
-      pop.style.lineHeight = baseLine;
-      pop.style.background = "rgba(0, 0, 0, 0.88)";
-      pop.style.border = "1px solid rgba(255, 255, 255, 0.12)";
-      pop.style.borderRadius = "6px";
-      pop.style.color = "#ddd";
-      pop.style.whiteSpace = "pre";
-      pop.style.display = "none";
-      pop.style.pointerEvents = "none";
-      pop.style.zIndex = "21";
-      container.appendChild(pop);
-      this.popupEl = pop;
-    }
+    // Intentionally do not render any built-in UI for cmdline/messages/popupmenu.
+    // Hosts should provide `onCmdline` / `onMessage` / `onPopupmenu` to render overlays
+    // in a way that matches their app's styling.
   }
 
   setCmdline(text: string | null): void {
@@ -151,6 +82,7 @@ export class OverlayManager {
     this.cmdlineCursorByte = null;
     this.cmdlineCursorOffsetBytes = 0;
     this.cmdlineCursorContentBytes = 0;
+    this.cmdlineVisible = Boolean(text && text !== "");
     if (this.callbacks.onCmdline) {
       try { this.callbacks.onCmdline(text); } catch (_) {}
     }
@@ -158,12 +90,10 @@ export class OverlayManager {
     if (text == null || text === "") {
       this.cmdlineEl.textContent = "";
       this.cmdlineEl.style.display = "none";
-      this.cmdlineVisible = false;
       return;
     }
     this.cmdlineEl.textContent = text;
     this.cmdlineEl.style.display = "block";
-    this.cmdlineVisible = true;
   }
 
   setCmdlineCursor(bytePos: number | null): void {
@@ -182,6 +112,7 @@ export class OverlayManager {
   }
 
   setMessage(text: string | null): void {
+    this.messageTextRaw = text == null ? null : String(text);
     if (this.callbacks.onMessage) {
       try { this.callbacks.onMessage(text); } catch (_) {}
     }
@@ -208,32 +139,8 @@ export class OverlayManager {
     this.popupSelected = selected;
     if (this.callbacks.onPopupmenu) {
       try { this.callbacks.onPopupmenu(items, selected); } catch (_) {}
-    }
-    if (!this.popupEl) return;
-    if (!items || !items.length) {
-      this.popupEl.textContent = "";
-      this.popupEl.style.display = "none";
       return;
     }
-    this.popupEl.innerHTML = "";
-    for (let i = 0; i < items.length; i += 1) {
-      const it = items[i];
-      const row = document.createElement("div");
-      row.style.padding = "2px 10px";
-      row.style.display = "flex";
-      row.style.gap = "10px";
-      row.style.justifyContent = "space-between";
-      row.style.background = i === selected ? "rgba(255,255,255,0.12)" : "transparent";
-      const left = document.createElement("span");
-      left.textContent = it.word ?? "";
-      const right = document.createElement("span");
-      right.style.opacity = "0.7";
-      right.textContent = it.menu ?? it.kind ?? "";
-      row.appendChild(left);
-      row.appendChild(right);
-      this.popupEl.appendChild(row);
-    }
-    this.popupEl.style.display = "block";
   }
 
   updatePopupmenuSelection(selected: number): void {
@@ -242,11 +149,6 @@ export class OverlayManager {
     if (this.callbacks.onPopupmenu) {
       try { this.callbacks.onPopupmenu(this.popupItems, selected); } catch (_) {}
       return;
-    }
-    if (!this.popupEl) return;
-    const children = Array.from(this.popupEl.children) as HTMLElement[];
-    for (let i = 0; i < children.length; i += 1) {
-      children[i].style.background = i === selected ? "rgba(255,255,255,0.12)" : "transparent";
     }
   }
 
@@ -316,6 +218,7 @@ export class OverlayManager {
     this.cmdlineCursorByte = null;
     this.cmdlineCursorOffsetBytes = 0;
     this.cmdlineCursorContentBytes = 0;
+    this.messageTextRaw = null;
     this.popupItems = [];
     this.popupSelected = -1;
   }
@@ -326,15 +229,12 @@ export class OverlayManager {
     if (!container) return;
     this.ensureRelativePosition(container);
     const el = document.createElement("div");
+    el.className = "monaco-neovim-wasm-preedit";
     el.style.position = "absolute";
     el.style.display = "none";
     el.style.pointerEvents = "none";
     el.style.zIndex = "40";
     el.style.whiteSpace = "pre";
-    el.style.padding = "0 1px";
-    el.style.background = "rgba(0, 0, 0, 0.15)";
-    el.style.borderBottom = "1px solid rgba(255, 255, 255, 0.6)";
-    el.style.borderRadius = "2px";
     try {
       const fontInfo = this.editor.getOption(monaco.editor.EditorOption.fontInfo);
       if (fontInfo?.fontFamily) el.style.fontFamily = fontInfo.fontFamily;

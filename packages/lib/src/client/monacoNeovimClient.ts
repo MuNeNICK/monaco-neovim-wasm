@@ -1261,8 +1261,14 @@ export class MonacoNeovimClient {
       await this.rpcCall("nvim_buf_set_lines", [buf, 0, -1, false, seed]);
       await this.rpcCall("nvim_buf_set_option", [buf, "modified", Boolean(this.opts.seedMarkModified)]);
       await this.rpcCall("nvim_buf_set_option", [buf, "buftype", ""]);
-      await this.rpcCall("nvim_buf_set_option", [buf, "filetype", this.opts.seedFiletype]);
-      await this.rpcCall("nvim_buf_set_name", [buf, this.opts.seedName]);
+      if (this.opts.seedFiletype) {
+        await this.rpcCall("nvim_buf_set_option", [buf, "filetype", this.opts.seedFiletype]);
+      }
+      // Only set a buffer name when explicitly provided: hostCommands may use the buffer name as the
+      // default write target (e.g. `:w` without args). A shared default name can cause data loss.
+      if (this.opts.seedName) {
+        await this.rpcCall("nvim_buf_set_name", [buf, this.opts.seedName]);
+      }
       if (restoreModifiable === false) {
         try { await this.rpcCall("nvim_buf_set_option", [buf, "modifiable", false]); } catch (_) {}
       }

@@ -45,15 +45,6 @@ export class ClipboardManager {
       const lines = (text || "").split(/\r?\n/);
       this.init.sendRpcResponse(msgid, null, [lines, "v"]);
     };
-    const promptPaste = () => {
-      try {
-        if (typeof navigator !== "undefined" && (navigator as any)?.webdriver) return null;
-        if (typeof window === "undefined" || typeof window.prompt !== "function") return null;
-        return window.prompt("Paste text");
-      } catch (_) {
-        return null;
-      }
-    };
 
     const adapter = this.init.adapter;
     if (adapter === null) {
@@ -64,21 +55,21 @@ export class ClipboardManager {
       adapter.readText()
         .then((text) => fallback(text || ""))
         .catch(() => {
-          const manual = promptPaste();
-          fallback(manual ?? this.init.getLastClipboardText());
+          try { this.init.status?.("clipboard read failed (adapter)", true); } catch (_) {}
+          fallback("");
         });
       return;
     }
     if (!navigator.clipboard?.readText) {
-      const manual = promptPaste();
-      fallback(manual ?? this.init.getLastClipboardText());
+      try { this.init.status?.("clipboard read unavailable (no adapter / Clipboard API)", true); } catch (_) {}
+      fallback("");
       return;
     }
     navigator.clipboard.readText()
       .then((text) => fallback(text || ""))
       .catch(() => {
-        const manual = promptPaste();
-        fallback(manual ?? this.init.getLastClipboardText());
+        try { this.init.status?.("clipboard read failed (Clipboard API)", true); } catch (_) {}
+        fallback("");
       });
   }
 }

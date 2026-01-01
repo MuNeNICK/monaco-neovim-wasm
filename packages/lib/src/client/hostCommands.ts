@@ -72,7 +72,10 @@ export class HostCommandManager {
         } catch (_) {
         }
       }
-      if (!path) path = this.init.seedName;
+      if (!path) {
+        this.init.status("write: no path (provide cmd.path, set a buffer name, or implement onHostCommand)", true);
+        return;
+      }
       if (!fs.writeFile) {
         this.init.status("write: fileSystem.writeFile not set", true);
         return;
