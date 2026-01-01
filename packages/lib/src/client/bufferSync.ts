@@ -41,6 +41,7 @@ export type BufferSyncManagerInit = {
 
   isDelegateInsertToMonaco: () => boolean;
   isExitingInsertMode: () => boolean;
+  shouldAcceptNvimBufLinesDuringDelegatedInsert: () => boolean;
   isCompositionActive: () => boolean;
   setPendingResyncAfterComposition: (pending: boolean) => void;
 
@@ -48,6 +49,7 @@ export type BufferSyncManagerInit = {
   getInsertSyncDebounceMs: () => number;
 
   scheduleVisualSelectionRefresh: () => void;
+  scheduleCursorRefresh: () => void;
   getLastMode: () => string;
   isVisualMode: (mode: string) => boolean;
 
@@ -156,13 +158,21 @@ export class BufferSyncManager {
       if (model.getValue() === joined) return;
     } catch (_) {
     }
-    const pos = this.init.getLastCursorPos() ?? this.init.getEditorPosition() ?? new monaco.Position(1, 1);
+    const pos = this.init.isDelegateInsertToMonaco()
+      ? (this.init.getEditorPosition() ?? this.init.getLastCursorPos() ?? new monaco.Position(1, 1))
+      : (this.init.getLastCursorPos() ?? this.init.getEditorPosition() ?? new monaco.Position(1, 1));
     this.init.setSuppressCursorSync(true);
     this.init.setApplyingFromNvim(true);
     try { model.setValue(joined); } catch (_) {}
     this.init.setApplyingFromNvim(false);
     try { if (pos) this.init.editor.setPosition(pos); } catch (_) {}
     this.init.setSuppressCursorSync(false);
+    if (!this.init.isDelegateInsertToMonaco()) {
+      // `buf_set_lines` can update the model without necessarily triggering a
+      // CursorMoved notify (e.g. when Neovim cursor did not change but Monaco
+      // drifted). Always refresh the cursor after applying a full buffer update.
+      this.init.scheduleCursorRefresh();
+    }
     if (this.init.isDelegateInsertToMonaco()) {
       const state = this.init.getActiveState();
       if (state && state.model === model) {
@@ -282,6 +292,12 @@ export class BufferSyncManager {
       `flushPendingMonacoSync: full=${state.pendingFullSync} edits=${state.pendingBufEdits.length} cursor=${state.pendingCursorSync} delegateInsert=${this.init.isDelegateInsertToMonaco()} exitingInsert=${this.init.isExitingInsertMode()}`,
     );
 
+    if (this.init.isDelegateInsertToMonaco() && state.pendingBufEdits.length) {
+      // In delegated insert, Monaco is the source of truth. Prefer full-buffer
+      // sync so Neovim never applies stale byte offsets from incremental edits.
+      state.pendingFullSync = true;
+    }
+
     if (!state.pendingFullSync && state.pendingBufEdits.length > 1) {
       state.pendingFullSync = true;
     }
@@ -326,6 +342,10 @@ export class BufferSyncManager {
     } catch (_) {
     }
 
+    if (this.init.isDelegateInsertToMonaco() && state.pendingBufEdits.length) {
+      state.pendingFullSync = true;
+    }
+
     if (!state.pendingFullSync && state.pendingBufEdits.length > 1) {
       state.pendingFullSync = true;
     }
@@ -368,7 +388,7 @@ export class BufferSyncManager {
       const state = (bufHandle != null && id === bufHandle) ? this.init.ensureActiveState() : (this.init.getBufferState(id) ?? null);
       if (!state) return;
 
-      if (bufHandle != null && id === bufHandle && this.init.isDelegateInsertToMonaco() && !this.init.isExitingInsertMode()) {
+      if (bufHandle != null && id === bufHandle && this.init.isDelegateInsertToMonaco()) {
         if (this.init.nowMs() < this.ignoreActiveBufLinesEventsUntil) return;
       }
       if (bufHandle != null && id === bufHandle && this.init.isCompositionActive()) {
@@ -388,6 +408,18 @@ export class BufferSyncManager {
             const patch = this.computeLinePatch(model!, fl, ll, newLines!);
             let isNoop = false;
             try { isNoop = model!.getValueInRange(patch.range) === patch.text; } catch (_) {}
+            if (
+              !isNoop
+              && !this.init.shouldAcceptNvimBufLinesDuringDelegatedInsert()
+            ) {
+              // In insert-mode delegation, Monaco owns the buffer text. Neovim
+              // can emit late `buf_lines` events for intermediate states that
+              // would overwrite newer Monaco edits (leading to character
+              // reordering). Ignore non-noop updates unless we explicitly
+              // forwarded keys to Neovim and expect it to mutate the buffer.
+              this.init.debugLog(`handleNvimBufLinesEvent: ignore active buf_lines during delegated insert fl=${fl} ll=${ll}`);
+              return;
+            }
             if (!isNoop) {
               if (state.pendingFullSync || state.pendingBufEdits.length) {
                 this.scheduleResync();
@@ -396,6 +428,9 @@ export class BufferSyncManager {
               this.applyLinePatchToModel(model!, fl, ll, newLines!);
               try { state.shadowLines = model!.getLinesContent(); } catch (_) {}
             }
+          } else if (isActiveModel) {
+            this.applyLinePatch(model!, fl, ll, newLines!);
+            if (!this.init.isDelegateInsertToMonaco()) this.init.scheduleCursorRefresh();
           } else if (isActiveModel) {
             this.applyLinePatch(model!, fl, ll, newLines!);
           } else {
@@ -456,7 +491,9 @@ export class BufferSyncManager {
   }
 
   private applyLinePatch(model: monaco.editor.ITextModel, firstline: number, lastline: number, newLines: string[]): void {
-    const pos = this.init.getLastCursorPos() ?? this.init.getEditorPosition() ?? new monaco.Position(1, 1);
+    const pos = this.init.isDelegateInsertToMonaco()
+      ? (this.init.getEditorPosition() ?? this.init.getLastCursorPos() ?? new monaco.Position(1, 1))
+      : (this.init.getLastCursorPos() ?? this.init.getEditorPosition() ?? new monaco.Position(1, 1));
     const patch = this.computeLinePatch(model, firstline, lastline, newLines);
     try {
       const existing = model.getValueInRange(patch.range);

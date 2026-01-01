@@ -38,16 +38,13 @@ local function make_range(buf, start_pos, end_pos)
 end
 
 local function make_range_params(buf, start_pos, end_pos)
-  if has_lsp then
-    return lsp.util.make_given_range_params(start_pos, end_pos, buf, "utf-16").range
-  end
   return make_range(buf, start_pos, end_pos)
 end
 
 local function get_char_at(line, byte_col, buf)
   buf = buf or api.nvim_get_current_buf()
-  local line_str = fn.getbufoneline(buf, line)
-  local char_idx = fn.charidx(line_str, (byte_col - 1))
+  local line_str = api.nvim_buf_get_lines(buf, line - 1, line, false)[1] or ""
+  local char_idx = fn.charidx(line_str, math.max(0, (byte_col - 1)))
   local char_nr = fn.strgetchar(line_str, char_idx)
   if char_nr ~= -1 then
     return fn.nr2char(char_nr)
@@ -56,22 +53,19 @@ local function get_char_at(line, byte_col, buf)
 end
 
 local function virtcol2col(winid, lnum, virtcol)
-  if fn.has("nvim-0.10.0") == 0 then
+  if fn.exists("*virtcol2col") == 1 then
     return fn.virtcol2col(winid, lnum, virtcol)
   end
-  local byte_idx = fn.virtcol2col(winid, lnum, virtcol) - 1
-  local buf = api.nvim_win_get_buf(winid)
-  local line = api.nvim_buf_get_lines(buf, lnum - 1, lnum, false)[1] or ""
-  local char_idx = fn.charidx(line, byte_idx)
-  local prefix = fn.strcharpart(line, 0, char_idx + 1)
-  return #prefix
+  -- Fallback for older versions: for ASCII (and most simple cases) virtcol
+  -- matches byte columns closely enough for visual selection syncing.
+  return virtcol
 end
 
 local function get_selections(win)
   win = win or api.nvim_get_current_win()
   local buf = api.nvim_win_get_buf(win)
   local mode = api.nvim_get_mode().mode
-  local is_visual = mode:match("[vV\\022]")
+  local is_visual = mode:match("[vV\022]")
 
   local function wincall(cb)
     return api.nvim_win_call(win, cb)
@@ -138,6 +132,9 @@ local function get_selections(win)
       local end_col = virtcol2col(win, line_1, end_vcol)
       local start_col_offset = fn.strlen(get_char_at(line_1, start_col, buf) or "")
       local end_col_offset = fn.strlen(get_char_at(line_1, end_col, buf) or "")
+      if vim.o.selection == "exclusive" and end_col_offset > 0 then
+        end_col = end_col + end_col_offset
+      end
       local range = make_range_params(
         buf,
         { line_1, math.max(0, start_col - start_col_offset) },
@@ -166,4 +163,3 @@ local function get_selections(win)
 end
 
 return get_selections(...)
-

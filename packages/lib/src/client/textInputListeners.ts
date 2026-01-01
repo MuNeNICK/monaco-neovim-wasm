@@ -38,8 +38,8 @@ export type TextInputListenerInit = {
 
   setPreedit: (text: string | null) => void;
 
-  armIgnoreNextInputEvent: (target: EventTarget | null, ms: number) => void;
-  shouldIgnoreNextInputEvent: (target: EventTarget | null) => boolean;
+  armIgnoreNextInputEvent: (target: EventTarget | null, ms: number, expectedData?: string | null) => void;
+  shouldIgnoreNextInputEvent: (target: EventTarget | null, data?: unknown) => boolean;
   clearIgnoreNextInputEvent: () => void;
 
   nowMs: () => number;
@@ -292,14 +292,30 @@ export function installTextInputListeners(init: TextInputListenerInit): Disposab
 
   const onBeforeInput = (e: Event) => {
     if (!isEditorEvent(e)) return;
-    if (init.isDelegateInsertToMonaco() && !init.isExitingInsertMode()) return;
+    const ie = e as InputEvent;
+    if (init.isDelegateInsertToMonaco() && !init.isExitingInsertMode()) {
+      // When we preventDefault a keydown (normal/visual/etc), some browsers can
+      // still emit a follow-up `beforeinput`/`input`. If insert delegation was
+      // toggled on in between, that stale event would apply to Monaco and can
+      // reorder characters (e.g. first typed char appears at the end).
+      if (init.shouldIgnoreNextInputEvent(ie.target, (ie as any).data)) {
+        const target = asMaybeInputTarget(ie.target);
+        stopAll(e);
+        try { (e as InputEvent).preventDefault?.(); } catch (_) {}
+        init.clearIgnoreNextInputEvent();
+        try {
+          if ((target as any)?.tagName === "TEXTAREA") (target as HTMLTextAreaElement).value = "";
+          else if (target) target.textContent = "";
+        } catch (_) {}
+      }
+      return;
+    }
     const target = asMaybeInputTarget(e.target);
     stopAll(e);
     try { (e as InputEvent).preventDefault?.(); } catch (_) {}
 
     const lastMode = init.getLastMode();
     if (isInsertLike(lastMode) && !init.isCompositionActive()) {
-      const ie = e as InputEvent;
       const inputType = typeof (ie as any).inputType === "string" ? String((ie as any).inputType) : "";
       const composing = Boolean((ie as any).isComposing);
       const data = typeof ie.data === "string" ? ie.data : "";
@@ -307,7 +323,7 @@ export function installTextInputListeners(init: TextInputListenerInit): Disposab
       if (!composing && !inputType.includes("Composition")) {
         if (inputType === "insertText" || inputType === "insertReplacementText" || inputType === "insertFromDrop") {
           if (data) {
-            init.armIgnoreNextInputEvent(ie.target, 120);
+            init.armIgnoreNextInputEvent(ie.target, 120, data);
             init.sendImeText(data);
           }
           try {
@@ -317,7 +333,7 @@ export function installTextInputListeners(init: TextInputListenerInit): Disposab
           return;
         }
         if (inputType === "insertLineBreak" || inputType === "insertParagraph") {
-          init.armIgnoreNextInputEvent(ie.target, 120);
+          init.armIgnoreNextInputEvent(ie.target, 120, null);
           init.sendInput("<CR>");
           try {
             if ((target as any)?.tagName === "TEXTAREA") (target as HTMLTextAreaElement).value = "";
@@ -326,7 +342,7 @@ export function installTextInputListeners(init: TextInputListenerInit): Disposab
           return;
         }
         if (inputType === "deleteContentBackward") {
-          init.armIgnoreNextInputEvent(ie.target, 120);
+          init.armIgnoreNextInputEvent(ie.target, 120, null);
           init.sendInput("<BS>");
           try {
             if ((target as any)?.tagName === "TEXTAREA") (target as HTMLTextAreaElement).value = "";
@@ -335,7 +351,7 @@ export function installTextInputListeners(init: TextInputListenerInit): Disposab
           return;
         }
         if (inputType === "deleteContentForward") {
-          init.armIgnoreNextInputEvent(ie.target, 120);
+          init.armIgnoreNextInputEvent(ie.target, 120, null);
           init.sendInput("<Del>");
           try {
             if ((target as any)?.tagName === "TEXTAREA") (target as HTMLTextAreaElement).value = "";
@@ -359,12 +375,24 @@ export function installTextInputListeners(init: TextInputListenerInit): Disposab
 
   const onInput = (e: Event) => {
     if (!isEditorEvent(e)) return;
-    if (init.isDelegateInsertToMonaco() && !init.isExitingInsertMode()) return;
-    const target = asMaybeInputTarget((e as InputEvent).target);
-    stopAll(e);
     const ie = e as InputEvent;
+    if (init.isDelegateInsertToMonaco() && !init.isExitingInsertMode()) {
+      if (init.shouldIgnoreNextInputEvent(ie.target, (ie as any).data)) {
+        const target = asMaybeInputTarget(ie.target);
+        stopAll(e);
+        try { (e as InputEvent).preventDefault?.(); } catch (_) {}
+        init.clearIgnoreNextInputEvent();
+        try {
+          if ((target as any)?.tagName === "TEXTAREA") (target as HTMLTextAreaElement).value = "";
+          else if (target) target.textContent = "";
+        } catch (_) {}
+      }
+      return;
+    }
+    const target = asMaybeInputTarget(ie.target);
+    stopAll(e);
 
-    if (init.shouldIgnoreNextInputEvent(ie.target)) {
+    if (init.shouldIgnoreNextInputEvent(ie.target, (ie as any).data)) {
       init.clearIgnoreNextInputEvent();
       try {
         if ((target as any)?.tagName === "TEXTAREA") (target as HTMLTextAreaElement).value = "";
@@ -382,7 +410,7 @@ export function installTextInputListeners(init: TextInputListenerInit): Disposab
         : (!data && target?.textContent ? String(target.textContent) : "");
       const commit = data || fallback;
       if (commit) {
-        init.armIgnoreNextInputEvent(ie.target, 120);
+        init.armIgnoreNextInputEvent(ie.target, 120, commit);
         init.sendImeText(commit);
       }
     }
@@ -410,7 +438,7 @@ export function installTextInputListeners(init: TextInputListenerInit): Disposab
     const text = e.clipboardData?.getData("text/plain") ?? "";
     if (text) {
       e.preventDefault();
-      init.armIgnoreNextInputEvent(e.target, 150);
+      init.armIgnoreNextInputEvent(e.target, 150, null);
       init.pasteText(text);
     }
     try {

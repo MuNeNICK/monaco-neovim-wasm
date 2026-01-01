@@ -95,9 +95,12 @@ export class MonacoNeovimClient {
   private lastImeCommitAt = 0;
   private lastImeCommitText = "";
   private nvimBlocking = false;
+  private nvimExecuting = "";
   private editorReadOnly: boolean | null = null;
   private applyingFromNvim = false;
   private ignoreSelectionSyncUntil = 0;
+  private acceptNvimBufLinesDuringDelegatedInsertUntil = 0;
+  private pendingModePull = false;
 
   private debugLog(line: string): void {
     if (!this.opts.debug) return;
@@ -223,11 +226,13 @@ export class MonacoNeovimClient {
       getBufferState: (id) => this.bufferManager.getById(id),
       isDelegateInsertToMonaco: () => this.insertDelegation.isDelegating(),
       isExitingInsertMode: () => this.insertDelegation.isExitingInsertMode(),
+      shouldAcceptNvimBufLinesDuringDelegatedInsert: () => this.nowMs() < this.acceptNvimBufLinesDuringDelegatedInsertUntil,
       isCompositionActive: () => this.compositionActive,
       setPendingResyncAfterComposition: (pending) => { this.pendingResyncAfterComposition = pending; },
       getSyncModelFromMonaco: () => this.opts.syncModelFromMonaco,
       getInsertSyncDebounceMs: () => this.opts.insertSyncDebounceMs,
       scheduleVisualSelectionRefresh: () => this.visualSelection.scheduleRefresh(),
+      scheduleCursorRefresh: () => this.scheduleCursorRefresh(),
       getLastMode: () => this.lastMode,
       isVisualMode: (mode) => isVisualMode(mode),
       incrementPendingNvimBufUpdates: () => { this.pendingNvimBufUpdates += 1; },
@@ -286,6 +291,7 @@ export class MonacoNeovimClient {
       setPreedit: (text) => this.setPreedit(text),
       setEditorReadOnly: (readOnly) => this.setEditorReadOnly(readOnly),
       getRecordingRegister: () => this.recording.getRegister(),
+      getExecutingRegister: () => this.nvimExecuting,
       isNvimBlocking: () => this.nvimBlocking,
       getActiveState: () => this.getActiveState(),
       ensureActiveState: () => this.ensureActiveState(),
@@ -373,12 +379,13 @@ export class MonacoNeovimClient {
         isDelegating: () => this.insertDelegation.isDelegating(),
         exitDelegatedInsertMode: (key) => this.insertDelegation.exitDelegatedInsertMode(key),
         appendPendingKeysAfterExit: (keys) => this.insertDelegation.appendPendingKeysAfterExit(keys),
+        suppressDelegation: (ms) => this.insertDelegation.suppressDelegation(ms),
         getLastDelegatedDotRepeat: () => this.insertDelegation.getLastDelegatedDotRepeat(),
         clearLastDelegatedDotRepeat: () => this.insertDelegation.clearLastDelegatedDotRepeat(),
         recordRecentNormalKey: (key) => this.insertDelegation.recordRecentNormalKey(key),
       },
       handleNormalModeKey: (key) => this.recording.handleNormalModeKey(key),
-      armIgnoreNextInputEvent: (target, ms) => this.inputEventDeduper.arm(target, ms),
+      armIgnoreNextInputEvent: (target, ms, expectedData) => this.inputEventDeduper.arm(target, ms, expectedData),
       flushPendingMonacoSync: () => this.flushPendingMonacoSync(),
       sendInput: (keys) => this.sendInput(keys),
       scheduleCursorRefresh: () => this.scheduleCursorRefresh(),
@@ -819,16 +826,30 @@ export class MonacoNeovimClient {
   private handleNotifyMonacoMode(params: unknown[]): void {
     let m = "";
     let blocking: boolean | undefined = undefined;
+    let recording: string | undefined = undefined;
+    let executing: string | undefined = undefined;
+    let cursorLn: number | undefined = undefined;
+    let cursorCol0: number | undefined = undefined;
     const p0 = params?.[0];
     const p1 = params?.[1];
+    const p2 = params?.[2];
+    const p3 = params?.[3];
+    const p4 = params?.[4];
+    const p5 = params?.[5];
     if (typeof p0 === "string") {
       m = String(p0);
     } else if (p0 && typeof p0 === "object") {
       const obj = p0 as any;
       if (typeof obj.mode === "string") m = String(obj.mode);
       if (typeof obj.blocking === "boolean") blocking = Boolean(obj.blocking);
+      if (typeof obj.recording === "string") recording = String(obj.recording);
+      if (typeof obj.executing === "string") executing = String(obj.executing);
     }
     if (typeof p1 === "boolean") blocking = Boolean(p1);
+    if (typeof p2 === "string") recording = String(p2);
+    if (typeof p3 === "string") executing = String(p3);
+    if (typeof p4 === "number" && Number.isFinite(p4)) cursorLn = Number(p4);
+    if (typeof p5 === "number" && Number.isFinite(p5)) cursorCol0 = Number(p5);
     if (!this.hostAutocmdInstaller.isInstalled()) {
       // Some environments can have the host autocmd Lua installed even if the
       // initial installation call didn't resolve cleanly. Once we observe a
@@ -837,6 +858,11 @@ export class MonacoNeovimClient {
       this.hostAutocmdInstaller.markInstalledFromNotify();
     }
     this.debugLog(`nvim->monaco mode: ${JSON.stringify(this.lastMode)} -> ${JSON.stringify(m)} blocking=${blocking}`);
+    if (recording != null) this.recording.setRegister(recording);
+    if (executing != null) this.nvimExecuting = String(executing ?? "");
+    if (cursorLn != null && cursorCol0 != null) {
+      this.handleNotifyMonacoCursor([cursorLn, cursorCol0]);
+    }
     this.applyNvimMode(m, blocking);
   }
 
@@ -923,8 +949,8 @@ export class MonacoNeovimClient {
       scheduleCursorSyncToNvim: () => this.scheduleCursorSyncToNvim(),
       scheduleResync: () => this.scheduleResync(),
       setPreedit: (text) => this.setPreedit(text),
-      armIgnoreNextInputEvent: (target, ms) => this.inputEventDeduper.arm(target, ms),
-      shouldIgnoreNextInputEvent: (target) => this.inputEventDeduper.shouldIgnore(target),
+      armIgnoreNextInputEvent: (target, ms, expectedData) => this.inputEventDeduper.arm(target, ms, expectedData),
+      shouldIgnoreNextInputEvent: (target, data) => this.inputEventDeduper.shouldIgnore(target, data),
       clearIgnoreNextInputEvent: () => this.inputEventDeduper.clear(),
       nowMs: () => this.nowMs(),
       setIgnoreSelectionSyncUntil: (deadlineMs) => { this.ignoreSelectionSyncUntil = deadlineMs; },
@@ -977,6 +1003,12 @@ export class MonacoNeovimClient {
       this.cursor.applyCursorStyle(m);
       if (this.opts.onModeChange) this.opts.onModeChange(m);
       void this.visualSelection.updateVisualSelection(m);
+      if (isInsertLike(prevMode) && !isInsertLike(m)) {
+        // When exiting delegated insert, Neovim's final "cursor-left" step can
+        // be missed by CursorMoved autocmds in some environments. Force a
+        // refresh so Monaco matches Neovim's normal-mode caret position.
+        this.scheduleCursorRefresh();
+      }
     }
     if (modeChanged && isVisualMode(prevMode) && !isVisualMode(m)) {
       // Monaco selection can persist even after leaving visual mode; clear it to
@@ -1009,8 +1041,38 @@ export class MonacoNeovimClient {
     await this.bufferSync.flushPendingMonacoSyncBlocking();
   }
 
+  private scheduleModePull(): void {
+    if (this.pendingModePull) return;
+    this.pendingModePull = true;
+    globalThis.setTimeout(() => {
+      this.pendingModePull = false;
+      void this.rpcCall("nvim_get_mode", []).then((info) => {
+        const obj = info as any;
+        const m = typeof obj?.mode === "string" ? String(obj.mode) : "";
+        const blocking = typeof obj?.blocking === "boolean" ? Boolean(obj.blocking) : undefined;
+        if (m) this.applyNvimMode(m, blocking);
+      }).catch(() => {});
+    }, 0);
+  }
+
   private sendInput(keys: string): void {
+    if (this.insertDelegation.isDelegating() && !this.insertDelegation.isExitingInsertMode()) {
+      this.acceptNvimBufLinesDuringDelegatedInsertUntil = this.nowMs() + 500;
+    }
     this.sendNotify("nvim_input", [keys]);
+    if (
+      this.lastMode.startsWith("n")
+      && !this.insertDelegation.isDelegating()
+      && !this.insertDelegation.isExitingInsertMode()
+      && typeof keys === "string"
+      && keys.length === 1
+      && (keys === "i" || keys === "a" || keys === "I" || keys === "A" || keys === "o" || keys === "O")
+    ) {
+      // Host autocmd `monaco_mode` can lag slightly after insert-entry keys.
+      // Pull mode via RPC to reduce the window where the first characters of a
+      // delegated insert go through the non-delegated pipeline.
+      this.scheduleModePull();
+    }
   }
 
   private pasteText(text: string): void {

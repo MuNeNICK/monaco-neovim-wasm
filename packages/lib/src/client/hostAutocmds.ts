@@ -62,12 +62,15 @@ local function send_cursor()
   cursor_timer = vim.defer_fn(flush_cursor, 5)
 end
 
-local function send_mode()
-  local info = api.nvim_get_mode() or {}
-  local m = info.mode or ""
-  local blocking = info.blocking and true or false
-  vim.rpcnotify(chan, "monaco_mode", m, blocking)
-end
+	local function send_mode()
+	  local info = api.nvim_get_mode() or {}
+	  local m = info.mode or ""
+	  local blocking = info.blocking and true or false
+	  local rec = fn.reg_recording() or ""
+	  local exec = fn.reg_executing() or ""
+	  local cur = api.nvim_win_get_cursor(0)
+	  vim.rpcnotify(chan, "monaco_mode", m, blocking, rec, exec, cur[1], cur[2])
+	end
 
 local function send_scrolloff()
   local so = vim.o.scrolloff or 0
@@ -92,23 +95,24 @@ end
 
 local group = api.nvim_create_augroup("MonacoNeovimWasm", { clear = true })
 local function setup_visual_changed()
-  local ok = pcall(function()
-    local visual_ns = api.nvim_create_namespace("monaco.visual.changed")
-    local is_visual, last_visual_pos, last_curr_pos
-    local function fire_visual_changed()
-      vim.rpcnotify(chan, "monaco_visual_changed")
-    end
-    api.nvim_create_autocmd({ "ModeChanged" }, {
-      group = group,
-      callback = function(ev)
-        local mode = api.nvim_get_mode().mode
-        is_visual = mode:match("[vV\\022]")
-        if ev.match:match("[vV\\022]") then
-          last_visual_pos = fn.getpos("v")
-          last_curr_pos = fn.getpos(".")
-          fire_visual_changed()
-        end
-      end,
+	  local ok = pcall(function()
+	    local visual_ns = api.nvim_create_namespace("monaco.visual.changed")
+	    local block = string.char(22)
+	    local is_visual, last_visual_pos, last_curr_pos
+	    local function fire_visual_changed()
+	      vim.rpcnotify(chan, "monaco_visual_changed")
+	    end
+	    api.nvim_create_autocmd({ "ModeChanged" }, {
+	      group = group,
+	      callback = function(ev)
+	        local mode = api.nvim_get_mode().mode
+	        is_visual = mode:match("[vV" .. block .. "]")
+	        if ev.match:match("[vV" .. block .. "]") then
+	          last_visual_pos = fn.getpos("v")
+	          last_curr_pos = fn.getpos(".")
+	          fire_visual_changed()
+	        end
+	      end,
     })
     api.nvim_set_decoration_provider(visual_ns, {
       on_win = function()
@@ -181,4 +185,3 @@ vim.rpcnotify(chan, "monaco_buf_enter", {
 })
 `;
 }
-

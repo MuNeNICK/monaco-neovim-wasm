@@ -1,6 +1,6 @@
 {
   "name": "@monaco-neovim-wasm/lib",
-  "version": "0.1.21",
+  "version": "0.1.22",
   "private": false,
   "type": "module",
   "description": "Core library for running Neovim (WASM) behind Monaco via msgpack-RPC.",

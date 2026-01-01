@@ -1,6 +1,6 @@
 import type { editor as MonacoEditor } from "monaco-editor";
 
-import { isInsertLike } from "./modes";
+import { isInsertLike, isVisualMode } from "./modes";
 import type { BufferState } from "./bufferSync";
 import { charIndexToByteIndex } from "../utils/utf8";
 
@@ -13,6 +13,7 @@ export type InsertDelegationManagerInit = {
   setEditorReadOnly: (readOnly: boolean) => void;
 
   getRecordingRegister: () => string;
+  getExecutingRegister: () => string;
   isNvimBlocking: () => boolean;
 
   getActiveState: () => BufferState | null;
@@ -37,6 +38,9 @@ export class InsertDelegationManager {
   private exitingInsertMode = false;
   private pendingKeysAfterExit = "";
   private exitInsertTimer: number | null = null;
+  private lastMode = "";
+  private suppressDelegationUntil = 0;
+  private lastVisualModeAt = 0;
 
   private dotRepeatKeys = "";
   private dotRepeatBackspaces = 0;
@@ -68,6 +72,9 @@ export class InsertDelegationManager {
     this.lastDelegatedDotRepeat = null;
     this.ignoreInsertExitCursor = null;
     this.ignoreMonacoCursorSyncToNvimUntil = 0;
+    this.lastMode = "";
+    this.suppressDelegationUntil = 0;
+    this.lastVisualModeAt = 0;
   }
 
   isDelegating(): boolean {
@@ -115,9 +122,43 @@ export class InsertDelegationManager {
     return Number(ln) === g.line && Number(col0) === g.col0 && g.col0 > 0;
   }
 
+  suppressDelegation(ms: number): void {
+    const dur = Math.max(0, Math.floor(Number(ms) || 0));
+    if (dur <= 0) return;
+    this.suppressDelegationUntil = Math.max(this.suppressDelegationUntil, this.init.nowMs() + dur);
+  }
+
   applyMode(mode: string): void {
-    const nextDelegate = isInsertLike(mode) && !this.init.getRecordingRegister() && !this.init.isNvimBlocking();
+    const prevMode = this.lastMode;
+    this.lastMode = String(mode ?? "");
+    const now = this.init.nowMs();
+    if (isVisualMode(mode)) this.lastVisualModeAt = now;
+    const prefix = computeDelegatedInsertPrefix(this.recentNormalKeys);
+    const visualInsert = (prefix === "I" || prefix === "A") && (now - this.lastVisualModeAt) < 250;
+    const safePrefix = prefix === "i" || prefix === "a" || prefix === "I" || prefix === "A" || prefix === "o" || prefix === "O";
+    const enteringInsertFromNormal = isInsertLike(mode) && String(prevMode ?? "").startsWith("n");
+    const nextDelegate = enteringInsertFromNormal
+      ? (
+        safePrefix
+        && !this.init.getRecordingRegister()
+        && !this.init.getExecutingRegister()
+        && !this.init.isNvimBlocking()
+        && now >= this.suppressDelegationUntil
+        && !visualInsert
+      )
+      : (
+        isInsertLike(mode)
+          ? (
+            this.delegateInsertToMonaco
+            && !this.init.getRecordingRegister()
+            && !this.init.getExecutingRegister()
+            && !this.init.isNvimBlocking()
+            && now >= this.suppressDelegationUntil
+          )
+          : false
+      );
     if (nextDelegate !== this.delegateInsertToMonaco) {
+      const turnedOn = nextDelegate && !this.delegateInsertToMonaco;
       this.delegateInsertToMonaco = nextDelegate;
       this.init.setEditorReadOnly(!nextDelegate);
       const state = this.init.ensureActiveState();
@@ -126,7 +167,7 @@ export class InsertDelegationManager {
         this.dotRepeatKeys = "";
         this.dotRepeatBackspaces = 0;
         this.delegatedInsertReplayPossible = true;
-        this.lastDelegatedInsertPrefix = computeDelegatedInsertPrefix(this.recentNormalKeys);
+        this.lastDelegatedInsertPrefix = prefix;
         if (state) {
           state.shadowLines = this.init.editor.getModel()?.getLinesContent() ?? null;
           state.pendingBufEdits = [];
@@ -146,6 +187,8 @@ export class InsertDelegationManager {
         this.dotRepeatKeys = "";
         this.dotRepeatBackspaces = 0;
         this.delegatedInsertReplayPossible = false;
+      }
+      if (turnedOn) {
       }
     }
 

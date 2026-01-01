@@ -7,6 +7,7 @@ export type KeyHandlerInsertDelegation = {
   isDelegating: () => boolean;
   exitDelegatedInsertMode: (key: string) => void;
   appendPendingKeysAfterExit: (keys: string) => void;
+  suppressDelegation: (ms: number) => void;
   getLastDelegatedDotRepeat: () => { prefix: string; keys: string } | null;
   clearLastDelegatedDotRepeat: () => void;
   recordRecentNormalKey: (key: string) => void;
@@ -29,7 +30,7 @@ export type KeyHandlerManagerInit = {
   insertDelegation: KeyHandlerInsertDelegation;
   handleNormalModeKey: (key: string) => void;
 
-  armIgnoreNextInputEvent: (target?: EventTarget | null, ms?: number) => void;
+  armIgnoreNextInputEvent: (target?: EventTarget | null, ms?: number, expectedData?: string | null) => void;
   flushPendingMonacoSync: () => void;
   sendInput: (keys: string) => void;
   scheduleCursorRefresh: () => void;
@@ -75,7 +76,15 @@ export class KeyHandlerManager {
       }
       const key = this.init.translateKey(browserEvent);
       if (!key) return;
-      this.init.armIgnoreNextInputEvent(browserEvent.target, 120);
+      const expectedData = (typeof browserEvent.key === "string" && browserEvent.key.length === 1 && browserEvent.key !== "Dead")
+        ? browserEvent.key
+        : null;
+      const mode = this.init.getLastMode();
+      const insertEntry = mode.startsWith("n") && (
+        expectedData === "i" || expectedData === "a" || expectedData === "I" || expectedData === "A" || expectedData === "o" || expectedData === "O"
+      );
+      const ignoreMs = insertEntry ? 30 : 120;
+      this.init.armIgnoreNextInputEvent(browserEvent.target, ignoreMs, expectedData);
       ev.preventDefault();
       insertDelegation.appendPendingKeysAfterExit(key);
       return;
@@ -173,7 +182,14 @@ export class KeyHandlerManager {
 
     // Some browsers still dispatch an `input` event even if we preventDefault on
     // keydown. Ignore the next `input` to avoid double-sending text.
-    this.init.armIgnoreNextInputEvent(browserEvent.target, 120);
+    const expectedData = (typeof browserEvent.key === "string" && browserEvent.key.length === 1 && browserEvent.key !== "Dead")
+      ? browserEvent.key
+      : null;
+    const insertEntry = mode.startsWith("n") && (
+      expectedData === "i" || expectedData === "a" || expectedData === "I" || expectedData === "A" || expectedData === "o" || expectedData === "O"
+    );
+    const ignoreMs = insertEntry ? 30 : 120;
+    this.init.armIgnoreNextInputEvent(browserEvent.target, ignoreMs, expectedData);
     ev.preventDefault();
 
     if (mode.startsWith("n")) {
@@ -182,6 +198,9 @@ export class KeyHandlerManager {
       const dotRepeat = insertDelegation.getLastDelegatedDotRepeat();
       if (key === "." && dotRepeat) {
         const { prefix, keys: replay } = dotRepeat;
+        // The replay happens inside Neovim (feedkeys), so disable insert
+        // delegation temporarily to avoid ignoring Neovim-driven buffer edits.
+        insertDelegation.suppressDelegation(1500);
         this.init.sendInput(prefix);
         this.init.sendInput(replay);
         this.init.sendInput("<Esc>");
