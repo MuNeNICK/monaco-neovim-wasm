@@ -1,5 +1,5 @@
-export { MonacoNeovimClient, createMonacoNeovim } from "./monacoNeovim";
-export type { MonacoNeovimOptions, StatusEmitter, PopupMenuItem, ClipboardAdapter, FileSystemAdapter, HostCommand } from "./monacoNeovim";
+export { MonacoNeovimClient, createMonacoNeovim } from "./client/monacoNeovimClient";
+export type { MonacoNeovimOptions, StatusEmitter, PopupMenuItem, ClipboardAdapter, FileSystemAdapter, HostCommand } from "./types";
 export { NeovimWasmSession, isSharedArrayBufferAvailable } from "./neovimWasmSession";
 export type { NeovimWasmSessionInit, NeovimWasmSessionHandlers, NeovimWasmSessionStartOptions, NeovimWasmInputMode } from "./neovimWasmSession";
 

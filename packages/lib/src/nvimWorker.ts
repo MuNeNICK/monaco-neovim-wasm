@@ -2,13 +2,11 @@ import {
   WASI,
   wasi,
   Directory,
-  File,
-  PreopenDirectory,
   Fd,
-  Inode,
+  PreopenDirectory,
 } from "@bjorn3/browser_wasi_shim";
-import { gunzipSync } from "fflate";
 import { Decoder } from "./msgpack";
+import { applyExtraFiles, buildFs, FORWARD_NOTIFY_METHODS, getCachedRuntimeEntries, getCachedWasmBytes, makeEnv, RootedPreopenDirectory, type WorkerFile } from "./nvimWorkerCommon";
 type StartMessage = {
   type: "start";
   cols?: number;
@@ -17,14 +15,12 @@ type StartMessage = {
   runtimePath: string;
   inputBuffer?: SharedArrayBuffer | null;
   env?: Record<string, string> | null;
-  files?: Array<{ path: string; data: Uint8Array | ArrayBuffer | ArrayLike<number> | { type: "Buffer"; data: number[] } }> | null;
+  files?: WorkerFile[] | null;
 };
 
 type StopMessage = { type: "stop" };
 
 type InboundMessage = StartMessage | StopMessage;
-
-type DirNode = Directory & { contents: Map<string, any> };
 
 let rpcDecoder: Decoder | null = null;
 let activeWasi: WASI | null = null;
@@ -32,8 +28,6 @@ let inputFd: RingFd | null = null;
 const stderrDecoder = new TextDecoder();
 let lastStderr = "";
 let fatalSent = false;
-let cachedWasm: { url: string; bytes: Uint8Array } | null = null;
-let cachedRuntime: { url: string; entries: TarEntry[] } | null = null;
 
 self.addEventListener("error", (ev) => {
   if (fatalSent) return;
@@ -218,70 +212,6 @@ async function startNvim({ cols, rows, wasmPath, runtimePath, inputBuffer, env: 
   postMessage({ type: "exit", code: exitCode, lastStderr });
 }
 
-async function getCachedWasmBytes(url: string): Promise<Uint8Array> {
-  if (cachedWasm && cachedWasm.url === url && cachedWasm.bytes?.byteLength) return cachedWasm.bytes;
-  const bytes = await fetchBytes(url);
-  cachedWasm = { url, bytes };
-  return bytes;
-}
-
-async function getCachedRuntimeEntries(url: string): Promise<TarEntry[]> {
-  if (cachedRuntime && cachedRuntime.url === url && cachedRuntime.entries?.length) return cachedRuntime.entries;
-  const archive = await fetchBytes(url);
-  let runtimeBytes: Uint8Array;
-  if (looksLikeGzip(archive)) {
-    try {
-      runtimeBytes = gunzipSync(archive);
-    } catch (e) {
-      throw new Error(`gunzip runtime failed: ${(e as Error)?.message ?? e}`);
-    }
-  } else {
-    runtimeBytes = archive;
-  }
-  let entries: TarEntry[];
-  try {
-    entries = untar(runtimeBytes);
-  } catch (e) {
-    throw new Error(`untar runtime failed: ${(e as Error)?.message ?? e}`);
-  }
-  cachedRuntime = { url, entries };
-  return entries;
-}
-
-function applyExtraFiles(fsRoot: DirNode, files: Array<{ path: string; data: any }>) {
-  for (const file of files) {
-    const rawPath = String(file?.path ?? "");
-    const clean = rawPath.replace(/^\/+/, "").replace(/^\.\/+/, "");
-    if (!clean || clean.endsWith("/")) continue;
-    const data = toU8(file?.data);
-    if (!data) continue;
-    const parts = clean.split("/").filter(Boolean);
-    if (!parts.length) continue;
-    let dir: DirNode = fsRoot;
-    for (let i = 0; i < parts.length - 1; i += 1) {
-      const part = parts[i];
-      if (!dir.contents.has(part)) dir.contents.set(part, new Directory(new Map()));
-      dir = dir.contents.get(part) as DirNode;
-    }
-    const leaf = parts[parts.length - 1];
-    dir.contents.set(leaf, new File(data, { readonly: false }));
-  }
-}
-
-function toU8(data: any): Uint8Array | null {
-  if (!data) return new Uint8Array();
-  if (data instanceof Uint8Array) return data;
-  if (data instanceof ArrayBuffer) return new Uint8Array(data);
-  if (data instanceof SharedArrayBuffer) return new Uint8Array(data);
-  if (Array.isArray(data)) return new Uint8Array(data);
-  if (data && data.type === "Buffer" && Array.isArray(data.data)) return new Uint8Array(data.data);
-  try {
-    return new TextEncoder().encode(String(data));
-  } catch (_) {
-    return null;
-  }
-}
-
 function handleStdout(chunk: Uint8Array) {
   if (!rpcDecoder) {
     rpcDecoder = new Decoder(handleMessage);
@@ -313,169 +243,11 @@ function handleMessage(msg: unknown) {
       const lines = Array.isArray(params?.[0]) ? params[0] : [];
       const regtype = typeof params?.[1] === "string" ? params[1] : "v";
       postMessage({ type: "clipboard-copy", lines, regtype });
-    } else if (
-      method === "nvim_buf_lines_event"
-      || method === "nvim_buf_detach_event"
-      || method === "redraw"
-      || method === "monaco_cursor"
-      || method === "monaco_mode"
-      || method === "monaco_cursorMove"
-      || method === "monaco_scroll"
-      || method === "monaco_reveal"
-      || method === "monaco_moveCursor"
-      || method === "monaco_scrolloff"
-      || method === "monaco_host_command"
-      || method === "monaco_buf_enter"
-      || method === "monaco_buf_delete"
-    ) {
-      postMessage({ type: "rpc-notify", method, params });
-    }
-  }
-}
-
-async function fetchBytes(url: string): Promise<Uint8Array> {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`fetch ${url} failed (${res.status})`);
-  const ct = (res.headers.get("content-type") || "").toLowerCase();
-  if (ct.includes("text/html")) throw new Error(`fetch ${url} returned HTML (likely wrong path or dev server fallback)`);
-  const data = new Uint8Array(await res.arrayBuffer());
-  if (!data.byteLength) throw new Error(`fetch ${url} returned empty body`);
-  return data;
-}
-
-type TarEntry = { name: string; type: "dir" | "file"; data: Uint8Array };
-
-function looksLikeGzip(data: Uint8Array) {
-  return data && data.length >= 2 && data[0] === 0x1f && data[1] === 0x8b;
-}
-
-function untar(bytes: Uint8Array): TarEntry[] {
-  const files: TarEntry[] = [];
-  const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-  let offset = 0;
-  const decoder = new TextDecoder();
-  let safety = 0;
-
-  while (offset + 512 <= data.length) {
-    if (safety++ > 100_000) throw new Error("untar safety break");
-    const name = decodeTarString(decoder, data, offset, 100);
-    const sizeText = decodeTarString(decoder, data, offset + 124, 12);
-    const typeflag = data[offset + 156];
-    const prefix = decodeTarString(decoder, data, offset + 345, 155);
-    if (!name && !prefix) break;
-    const sizeRaw = sizeText.trim() || "0";
-    const size = parseInt(sizeRaw, 8);
-    if (!Number.isFinite(size) || size < 0) throw new Error(`invalid tar size: ${sizeRaw}`);
-    const fullName = prefix ? `${prefix}/${name}` : name;
-    const bodyStart = offset + 512;
-    const bodyEnd = bodyStart + size;
-    const payload = data.slice(bodyStart, bodyEnd);
-    files.push({ name: fullName, type: typeflag === 53 ? "dir" : "file", data: payload });
-    const blocks = Math.ceil(size / 512);
-    const next = bodyStart + blocks * 512;
-    if (next <= offset) throw new Error("tar parse did not advance");
-    offset = next;
-  }
-  return files;
-}
-
-function decodeTarString(decoder: TextDecoder, data: Uint8Array, start: number, length: number): string {
-  let end = start;
-  const max = start + length;
-  while (end < max && data[end] !== 0) end += 1;
-  return decoder.decode(data.subarray(start, end)).trim();
-}
-
-function buildFs(entries: TarEntry[], onProgress?: (count: number) => void) {
-  const root = new Directory(new Map()) as DirNode;
-  let count = 0;
-  for (const entry of entries) {
-    const clean = entry.name.replace(/^\.\/?/, "");
-    if (!clean) continue;
-    const parts = clean.split("/").filter(Boolean);
-    if (!parts.length) continue;
-    count += 1;
-    if (onProgress && count % 500 === 0) onProgress(count);
-
-    let dir: DirNode = root;
-    for (let i = 0; i < parts.length - 1; i += 1) {
-      const part = parts[i];
-      if (!dir.contents.has(part)) dir.contents.set(part, new Directory(new Map()));
-      dir = dir.contents.get(part) as DirNode;
-    }
-
-    const leaf = parts[parts.length - 1];
-    if (entry.type === "dir") {
-      if (!dir.contents.has(leaf)) dir.contents.set(leaf, new Directory(new Map()));
     } else {
-      dir.contents.set(leaf, new File(entry.data, { readonly: true }));
+      const m = typeof method === "string" ? method : "";
+      if (FORWARD_NOTIFY_METHODS.has(m)) {
+        postMessage({ type: "rpc-notify", method: m, params });
+      }
     }
-  }
-
-  ensureDir(root, "home");
-  ensureDir(root, "tmp");
-  ensureDir(root, "home/.config");
-  ensureDir(root, "home/.local/share");
-  ensureDir(root, "home/.local/state");
-
-  return root;
-}
-
-function ensureDir(root: DirNode, path: string) {
-  const parts = path.split("/").filter(Boolean);
-  let node: DirNode = root;
-  for (const p of parts) {
-    if (!node.contents.has(p)) node.contents.set(p, new Directory(new Map()));
-    node = node.contents.get(p) as DirNode;
-  }
-}
-
-function makeEnv(procExit?: (code: number) => void) {
-  const wasmAny = WebAssembly as any;
-  const cLongjmp = new wasmAny.Tag({ parameters: ["i32"], results: [] }) as any;
-  return {
-    flock: () => 0,
-    getpid: () => 1,
-    uv_random: () => -38,
-    uv_wtf8_to_utf16: () => {},
-    uv_utf16_length_as_wtf8: () => 0,
-    uv_utf16_to_wtf8: () => -38,
-    uv_wtf8_length_as_utf16: () => 0,
-    __wasm_longjmp: (ptr: number) => {
-      if (procExit) procExit(1);
-      throw new wasmAny.Exception(cLongjmp, [ptr ?? 0]);
-    },
-    __wasm_setjmp: () => 0,
-    __wasm_setjmp_test: () => 0,
-    tmpfile: () => 0,
-    clock: () => 0,
-    system: () => -1,
-    tmpnam: () => 0,
-    __c_longjmp: cLongjmp,
-  } as WebAssembly.ModuleImports;
-}
-
-class RootedPreopenDirectory extends PreopenDirectory {
-  #strip(path: string) { return path.replace(/^\/+/, ""); }
-  path_open(
-    dirflags: number,
-    path_str: string,
-    oflags: number,
-    fs_rights_base: bigint,
-    fs_rights_inheriting: bigint,
-    fd_flags: number,
-  ) {
-    return super.path_open(dirflags, this.#strip(path_str), oflags, fs_rights_base, fs_rights_inheriting, fd_flags);
-  }
-  path_filestat_get(flags: number, path_str: string) { return super.path_filestat_get(flags, this.#strip(path_str)); }
-  path_create_directory(path_str: string) { return super.path_create_directory(this.#strip(path_str)); }
-  path_unlink_file(path_str: string) { return super.path_unlink_file(this.#strip(path_str)); }
-  path_remove_directory(path_str: string) { return super.path_remove_directory(this.#strip(path_str)); }
-  path_link(path_str: string, inode: Inode, allow_dir: boolean) { return super.path_link(this.#strip(path_str), inode, allow_dir); }
-  path_readlink(path_str: string) { return super.path_readlink(this.#strip(path_str)); }
-  path_symlink(old_path: string, new_path: string) {
-    const target = (PreopenDirectory.prototype as unknown as { path_symlink?: (oldPath: string, newPath: string) => number }).path_symlink;
-    if (!target) return wasi.ERRNO_NOTSUP;
-    return target.call(this, this.#strip(old_path), this.#strip(new_path));
   }
 }

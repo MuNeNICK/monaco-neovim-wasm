@@ -39,6 +39,7 @@ export type NeovimWasmSessionStartOptions = {
 type PendingEntry = {
   resolve: (value: any) => void;
   reject: (reason?: unknown) => void;
+  timeoutId: number;
   ts: number;
   method: string;
 };
@@ -165,7 +166,10 @@ export class NeovimWasmSession {
       this.workerExitCode = 1;
       if (this.pending.size) {
         const err = new Error(message);
-        this.pending.forEach((entry) => entry.reject(err));
+        this.pending.forEach((entry) => {
+          clearTimeout(entry.timeoutId);
+          entry.reject(err);
+        });
         this.pending.clear();
       }
       try { this.init.handlers.onStartError?.(message); } catch (_) {}
@@ -208,12 +212,18 @@ export class NeovimWasmSession {
 
     if (this.pending.size) {
       const err = new Error("session stopped");
-      this.pending.forEach((entry) => entry.reject(err));
+      this.pending.forEach((entry) => {
+        clearTimeout(entry.timeoutId);
+        entry.reject(err);
+      });
       this.pending.clear();
     }
 
-    this.workerExited = false;
-    this.workerExitCode = null;
+    // Treat a manual stop as "exited" so `isRunning()` and `call()/notify()` don't
+    // keep sending data into a stopped worker instance (especially when reusing workers).
+    this.workerExited = true;
+    this.workerExitCode = 0;
+    this.workerFatalError = null;
 
     if (!this.worker) return;
     if (terminate) {
@@ -248,10 +258,7 @@ export class NeovimWasmSession {
         return;
       }
       const id = this.reqId++;
-      this.pending.set(id, { resolve, reject, ts: Date.now(), method });
-      const msg = encode([0, id, method, params] as any);
-      this.postInput(msg);
-      setTimeout(() => {
+      const timeoutId = globalThis.setTimeout(() => {
         if (!this.pending.has(id)) return;
         this.pending.delete(id);
         reject(new Error(this.workerExited
@@ -260,6 +267,9 @@ export class NeovimWasmSession {
             : `nvim exited${this.workerFatalError ? `: ${this.workerFatalError}` : ""}`)
           : `rpc timeout: ${method}`));
       }, this.init.rpcTimeoutMs);
+      this.pending.set(id, { resolve, reject, timeoutId, ts: Date.now(), method });
+      const msg = encode([0, id, method, params] as any);
+      this.postInput(msg);
     });
   }
 
@@ -301,6 +311,7 @@ export class NeovimWasmSession {
       const entry = this.pending.get(msgid);
       if (!entry) return;
       this.pending.delete(msgid);
+      clearTimeout(entry.timeoutId);
       if (error) entry.reject(new Error(String(error)));
       else entry.resolve(result);
       return;
@@ -344,7 +355,10 @@ export class NeovimWasmSession {
       if (this.pending.size) {
         const suffix = lastStderr ? `: ${lastStderr.trim()}` : "";
         const err = new Error(`nvim exited (${code})${suffix}`);
-        this.pending.forEach((entry) => entry.reject(err));
+        this.pending.forEach((entry) => {
+          clearTimeout(entry.timeoutId);
+          entry.reject(err);
+        });
         this.pending.clear();
       }
       try { this.init.handlers.onExit?.(code, lastStderr); } catch (_) {}
@@ -383,7 +397,7 @@ export class NeovimWasmSession {
 
   private scheduleFlushInput(): void {
     if (this.inputFlushTimer) return;
-    this.inputFlushTimer = window.setTimeout(() => {
+    this.inputFlushTimer = globalThis.setTimeout(() => {
       this.inputFlushTimer = null;
       this.flushInputQueue();
     }, 0);
@@ -431,7 +445,7 @@ export class NeovimWasmSession {
       this.inputQueueHead = 0;
     }
     if (this.inputQueueHead < this.inputQueue.length) {
-      this.inputFlushTimer = window.setTimeout(() => {
+      this.inputFlushTimer = globalThis.setTimeout(() => {
         this.inputFlushTimer = null;
         this.flushInputQueue();
       }, this.inputMode === "shared" ? 2 : 0);
