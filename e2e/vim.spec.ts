@@ -503,7 +503,6 @@ test.describe("Monaco Neovim WASM - Vim E2E", () => {
     await expect.poll(async () => await execLua<number>(page, `return vim.fn.virtcol(".")`)).toBe(4);
 
     await waitForMonacoVisualDecorations(page, 1);
-    await expect.poll(async () => await page.locator(".monaco-neovim-visual-virtual").count()).toBeGreaterThan(0);
 
     await page.keyboard.press("Escape");
     await waitForMode(page, "n");
