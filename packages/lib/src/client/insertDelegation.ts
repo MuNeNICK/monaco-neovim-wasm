@@ -38,6 +38,7 @@ export class InsertDelegationManager {
   private exitingInsertMode = false;
   private pendingKeysAfterExit = "";
   private exitInsertTimer: number | null = null;
+  private optimisticEnterTimer: number | null = null;
   private lastMode = "";
   private suppressDelegationUntil = 0;
   private lastVisualModeAt = 0;
@@ -64,6 +65,10 @@ export class InsertDelegationManager {
       clearTimeout(this.exitInsertTimer);
       this.exitInsertTimer = null;
     }
+    if (this.optimisticEnterTimer) {
+      clearTimeout(this.optimisticEnterTimer);
+      this.optimisticEnterTimer = null;
+    }
     this.dotRepeatKeys = "";
     this.dotRepeatBackspaces = 0;
     this.delegatedInsertReplayPossible = false;
@@ -75,6 +80,63 @@ export class InsertDelegationManager {
     this.lastMode = "";
     this.suppressDelegationUntil = 0;
     this.lastVisualModeAt = 0;
+  }
+
+  optimisticEnterDelegatedInsertFromKey(prefixKey: string): void {
+    const key = String(prefixKey ?? "");
+    if (!key || key.length !== 1) return;
+    const safePrefix = key === "i" || key === "a" || key === "I" || key === "A" || key === "o" || key === "O";
+    if (!safePrefix) return;
+    if (this.delegateInsertToMonaco) return;
+    if (this.exitingInsertMode) return;
+    const now = this.init.nowMs();
+    if (now < this.suppressDelegationUntil) return;
+    if (this.init.getRecordingRegister()) return;
+    if (this.init.getExecutingRegister()) return;
+    if (this.init.isNvimBlocking()) return;
+
+    // Enable delegation immediately to avoid a mode-notify lag window where the
+    // first typed characters are handled as normal-mode keys and later applied
+    // out of order relative to Monaco->Neovim buffer sync.
+    this.delegateInsertToMonaco = true;
+    this.init.setEditorReadOnly(false);
+    this.init.setPreedit(null);
+    this.dotRepeatKeys = "";
+    this.dotRepeatBackspaces = 0;
+    this.delegatedInsertReplayPossible = true;
+    this.lastDelegatedInsertPrefix = key;
+
+    const state = this.init.ensureActiveState();
+    if (state) {
+      state.shadowLines = this.init.editor.getModel()?.getLinesContent() ?? null;
+      state.pendingBufEdits = [];
+      state.pendingFullSync = false;
+      state.pendingCursorSync = false;
+    }
+
+    if (this.optimisticEnterTimer) clearTimeout(this.optimisticEnterTimer);
+    this.optimisticEnterTimer = globalThis.setTimeout(() => {
+      this.optimisticEnterTimer = null;
+      // If we never observed insert-mode, revert to read-only to avoid hosts
+      // accidentally editing the model in normal mode.
+      if (!isInsertLike(this.lastMode)) {
+        this.delegateInsertToMonaco = false;
+        this.init.setEditorReadOnly(true);
+        const st = this.init.ensureActiveState();
+        if (st) {
+          if (st.pendingBufEdits.length || st.pendingCursorSync || st.pendingFullSync) {
+            this.init.flushPendingMonacoSync();
+          }
+          st.shadowLines = null;
+          st.pendingBufEdits = [];
+          st.pendingFullSync = false;
+          st.pendingCursorSync = false;
+        }
+        this.dotRepeatKeys = "";
+        this.dotRepeatBackspaces = 0;
+        this.delegatedInsertReplayPossible = false;
+      }
+    }, 250);
   }
 
   isDelegating(): boolean {
