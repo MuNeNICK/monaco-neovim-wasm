@@ -19,6 +19,7 @@ jobs:
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
+          cache: npm
 
       - name: Install dependencies
         run: npm ci
@@ -43,8 +44,11 @@ jobs:
             -a -f packages/wasm-async/nvim-asyncify.wasm -a -f packages/wasm-async/nvim-runtime.tar.gz \
             || npm run build:assets
 
-      - name: Build library
-        run: npm -w @monaco-neovim-wasm/lib run build
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run e2e
+        run: npm run test:e2e
 
       - name: Publish
         env:

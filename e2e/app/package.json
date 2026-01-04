@@ -1,9 +1,0 @@
-{
-  "name": "monaco-neovim-wasm-e2e-app",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "@monaco-neovim-wasm/wasm-async": "0.1.26",
-    "monaco-editor": "^0.55.1"
-  }
-}

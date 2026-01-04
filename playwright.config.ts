@@ -6,8 +6,7 @@ const baseURL = process.env.E2E_BASE_URL ?? `http://127.0.0.1:${port}`;
 
 export default defineConfig({
   testDir: "./e2e",
-  retries: isCI ? 1 : 0,
-  // Prevent wasting ~1h when the app cannot start in CI.
+  retries: 0,
   maxFailures: isCI ? 1 : undefined,
   workers: 1,
   reporter: isCI ? [["github"], ["html", { open: "never" }]] : [["list"], ["html", { open: "never" }]],
@@ -26,11 +25,8 @@ export default defineConfig({
   webServer: process.env.E2E_BASE_URL
     ? undefined
     : {
-      // CI: build once + preview for deterministic startup (avoids on-demand dev bundling delays).
-      command: isCI
-        ? `sh -c "vite build --config e2e/app/vite.config.ts && vite preview --config e2e/app/vite.config.ts --host 127.0.0.1 --port ${port} --strictPort"`
-        : `vite --config e2e/app/vite.config.ts --host 127.0.0.1 --port ${port} --strictPort`,
+      command: `sh -c "vite build --config e2e/app/vite.config.ts && vite preview --config e2e/app/vite.config.ts --host 127.0.0.1 --port ${port} --strictPort"`,
       url: baseURL,
-      reuseExistingServer: !isCI,
+      reuseExistingServer: false,
     },
 });
