@@ -10,7 +10,8 @@ function! s:reveal(direction, resetCursor) abort
     endif
     return
   endif
-  call rpcnotify(g:monaco_neovim_wasm_chan, 'monaco_reveal', { 'direction': a:direction, 'resetCursor': a:resetCursor })
+  " Send the Neovim cursor line to avoid races where Monaco cursor sync is delayed.
+  call rpcnotify(g:monaco_neovim_wasm_chan, 'monaco_reveal', { 'direction': a:direction, 'resetCursor': a:resetCursor, 'line': line('.') })
 endfunction
 
 nnoremap <silent> z<CR> <Cmd>call <SID>reveal('top', v:true)<CR>

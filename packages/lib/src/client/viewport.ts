@@ -41,10 +41,6 @@ export class ViewportManager {
     const p = pos ?? this.init.editor.getPosition();
     if (!p) return false;
 
-    const lineHeight = Math.max(1, Number(this.init.editor.getOption(monaco.editor.EditorOption.lineHeight) as any) || 0);
-    const soPx = so * lineHeight;
-    if (soPx <= 0) return false;
-
     let layoutHeight = 0;
     try {
       const layout = this.init.editor.getLayoutInfo() as any;
@@ -64,6 +60,10 @@ export class ViewportManager {
       try { sp = this.init.editor.getScrolledVisiblePosition(p) as any; } catch (_) {}
     }
     if (!sp || !Number.isFinite(sp.top) || !Number.isFinite(sp.height)) return false;
+
+    const lineHeight = Math.max(1, Number(sp.height) || 0);
+    const soPx = so * lineHeight;
+    if (soPx <= 0) return false;
 
     const scrollTop = this.init.editor.getScrollTop();
     const cursorTop = sp.top;
@@ -167,8 +167,12 @@ export class ViewportManager {
     const direction = typeof arg.direction === "string" ? arg.direction : "";
     const resetCursor = Boolean(arg.resetCursor);
     const pos = this.init.editor.getPosition();
-    if (!pos) return false;
-    const line = pos.lineNumber;
+    const lineFromArg = Number((arg as any).line);
+    const line = Number.isFinite(lineFromArg) && lineFromArg > 0
+      ? Math.floor(lineFromArg)
+      : (pos?.lineNumber ?? 0);
+    if (!line) return false;
+    const col = Math.max(1, Math.floor(Number(pos?.column ?? 1) || 1));
 
     const rows = Math.max(1, this.init.getUiRows() || this.init.getDefaultRows());
     const fontInfo = this.init.editor.getOption(monaco.editor.EditorOption.fontInfo) as any;
@@ -198,6 +202,9 @@ export class ViewportManager {
           this.init.setLastCursorPos(next);
         }
       }
+      // Match Neovim behavior when `scrolloff` is set: keep the cursor within
+      // the scrolloff margins after a reveal (zt/zz/zb).
+      this.applyScrolloff(new monaco.Position(line, col));
     } catch (_) {
     }
     this.init.setSuppressCursorSync(false);
@@ -247,4 +254,3 @@ export class ViewportManager {
     this.init.setSuppressCursorSync(false);
   }
 }
-

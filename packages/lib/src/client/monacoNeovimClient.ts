@@ -101,6 +101,7 @@ export class MonacoNeovimClient {
   private ignoreSelectionSyncUntil = 0;
   private acceptNvimBufLinesDuringDelegatedInsertUntil = 0;
   private pendingModePull = false;
+  private suppressCursorRevealUntilMs = 0;
 
   private debugLog(line: string): void {
     if (!this.opts.debug) return;
@@ -754,6 +755,10 @@ export class MonacoNeovimClient {
   private handleNotifyMonacoReveal(params: unknown[]): void {
     const arg = params?.[0];
     if (arg && typeof arg === "object") {
+      // `monaco_reveal` can arrive before the debounced cursor update for the
+      // same Neovim state. Avoid a late cursor update re-centering the viewport
+      // (which would override zt/zz/zb behavior).
+      this.suppressCursorRevealUntilMs = this.nowMs() + 80;
       const resetCursor = this.viewport.applyMonacoReveal(arg as Record<string, unknown>);
       if (resetCursor && !this.insertDelegation.isExitingInsertMode()) this.syncCursorToNvimNow(true);
     }
@@ -1184,14 +1189,14 @@ export class MonacoNeovimClient {
       const keepSelection = visualActive || this.visualSelection.shouldKeepSelection(now, 120);
       if (isVisualMode(this.lastMode) || keepSelection) {
         const applied = this.viewport.applyScrolloff(validated);
-        if (!applied) this.editor.revealPositionInCenterIfOutsideViewport(validated);
+        if (!applied && now > this.suppressCursorRevealUntilMs) this.editor.revealPositionInCenterIfOutsideViewport(validated);
         this.requestSearchHighlightRefresh();
         return;
       }
       this.suppressCursorSync = true;
       this.editor.setPosition(validated);
       const applied = this.viewport.applyScrolloff(validated);
-      if (!applied) this.editor.revealPositionInCenterIfOutsideViewport(validated);
+      if (!applied && now > this.suppressCursorRevealUntilMs) this.editor.revealPositionInCenterIfOutsideViewport(validated);
       this.suppressCursorSync = false;
     }
     this.requestSearchHighlightRefresh();
@@ -1250,7 +1255,8 @@ export class MonacoNeovimClient {
       }
       this.visualSelection.deactivate();
       const applied = this.viewport.applyScrolloff(validated);
-      if (!applied) this.editor.revealPositionInCenterIfOutsideViewport(validated);
+      const now = this.nowMs();
+      if (!applied && now > this.suppressCursorRevealUntilMs) this.editor.revealPositionInCenterIfOutsideViewport(validated);
     }
     this.requestSearchHighlightRefresh();
   }
