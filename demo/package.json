@@ -9,7 +9,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@monaco-neovim-wasm/wasm-async": "0.1.23",
+    "@monaco-neovim-wasm/wasm-async": "0.1.24",
     "monaco-editor": "^0.55.1"
   },
   "devDependencies": {
