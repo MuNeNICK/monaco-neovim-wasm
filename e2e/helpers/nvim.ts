@@ -16,7 +16,7 @@ declare global {
 
 export async function waitForAppReady(page: Page) {
   await page.goto("/");
-  await expect(page.locator("#status")).toHaveText("ready", { timeout: process.env.CI ? 30_000 : 20_000 });
+  await expect(page.locator("#status")).toHaveText("ready", { timeout: 30_000 });
   await page.evaluate(() => {
     window.monacoEditor?.focus?.();
   });

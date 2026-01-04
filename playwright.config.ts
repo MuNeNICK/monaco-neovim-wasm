@@ -1,17 +1,13 @@
 import { defineConfig, devices } from "@playwright/test";
 
-const isCI = !!process.env.CI;
-const port = Number(process.env.E2E_PORT ?? "4173");
-const baseURL = process.env.E2E_BASE_URL ?? `http://127.0.0.1:${port}`;
-
 export default defineConfig({
   testDir: "./e2e",
   retries: 0,
-  maxFailures: isCI ? 1 : undefined,
+  maxFailures: undefined,
   workers: 1,
-  reporter: isCI ? [["github"], ["html", { open: "never" }]] : [["list"], ["html", { open: "never" }]],
+  reporter: [["github"], ["html", { open: "never" }]],
   use: {
-    baseURL,
+    baseURL: "http://127.0.0.1:4173",
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
     video: "retain-on-failure",
@@ -22,11 +18,9 @@ export default defineConfig({
       use: { ...devices["Desktop Chrome"] },
     },
   ],
-  webServer: process.env.E2E_BASE_URL
-    ? undefined
-    : {
-      command: `sh -c "vite build --config e2e/app/vite.config.ts && vite preview --config e2e/app/vite.config.ts --host 127.0.0.1 --port ${port} --strictPort"`,
-      url: baseURL,
-      reuseExistingServer: false,
-    },
+  webServer: {
+    command: "sh -c \"vite build --config e2e/app/vite.config.ts && vite preview --config e2e/app/vite.config.ts --host 127.0.0.1 --port 4173 --strictPort\"",
+    url: "http://127.0.0.1:4173",
+    reuseExistingServer: false,
+  },
 });

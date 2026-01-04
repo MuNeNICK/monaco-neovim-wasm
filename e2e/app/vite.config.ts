@@ -12,7 +12,7 @@ export default defineConfig({
     strictPort: true,
   },
   build: {
-    outDir: ".e2e-dist",
+    outDir: "dist",
     emptyOutDir: true,
   },
   optimizeDeps: {
