@@ -32,9 +32,10 @@ export class InputEventDeduper {
       this.clear();
       return false;
     }
-    if (this.target && target && this.target !== target) {
-      return false;
-    }
+    // Monaco can route keydown/beforeinput/input through different internal
+    // DOM nodes (e.g. hidden textarea). Rely primarily on time-window and the
+    // expected text payload; otherwise stale events may slip through and reorder
+    // the first typed character after insert-entry keys.
     if (this.expectedData != null) {
       const d = typeof data === "string" ? data : "";
       if (d !== this.expectedData) return false;

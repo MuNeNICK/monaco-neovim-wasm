@@ -201,7 +201,19 @@ export class InsertDelegationManager {
     if (isVisualMode(mode)) this.lastVisualModeAt = now;
     const prefix = computeDelegatedInsertPrefix(this.recentNormalKeys);
     const visualInsert = (prefix === "I" || prefix === "A") && (now - this.lastVisualModeAt) < 250;
-    const safePrefix = prefix === "i" || prefix === "a" || prefix === "I" || prefix === "A" || prefix === "o" || prefix === "O";
+    // `o`/`O` enter insert mode via a normal-mode command that also mutates the
+    // buffer (open a new line). Delegating immediately can race with the Neovim
+    // -> Monaco buffer update for that open-line, causing the first typed
+    // character to be reordered (e.g. "next" -> "extn"). Prefer Neovim-owned
+    // insert for these prefixes.
+    // Delegated insert requires that the first typed characters are handled by
+    // Monaco, otherwise Neovim-owned edits can land first and Monaco->Neovim
+    // patches may be applied relative to a stale shadow buffer (reordering the
+    // first character, e.g. "hello world" -> "helloworld ").
+    //
+    // Only `i` is currently robust enough; other insert-entry commands can
+    // involve additional cursor/buffer mutations and introduce timing windows.
+    const safePrefix = prefix === "i";
     const enteringInsertFromNormal = isInsertLike(mode) && String(prevMode ?? "").startsWith("n");
     const nextDelegate = enteringInsertFromNormal
       ? (

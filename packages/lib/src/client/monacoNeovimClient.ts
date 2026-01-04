@@ -1075,15 +1075,19 @@ export class MonacoNeovimClient {
       && !this.insertDelegation.isExitingInsertMode()
       && typeof keys === "string"
       && keys.length === 1
-      && keys === "i"
     ) {
-      // Optimistically enable delegated insert immediately to avoid a short
-      // window where mode notifications lag behind insert-entry keys.
-      this.insertDelegation.optimisticEnterDelegatedInsertFromKey(keys);
-      // Host autocmd `monaco_mode` can lag slightly after insert-entry keys.
-      // Pull mode via RPC to reduce the window where the first characters of a
-      // delegated insert go through the non-delegated pipeline.
-      this.scheduleModePull();
+      const insertEntry = keys === "i" || keys === "a" || keys === "I" || keys === "A" || keys === "o" || keys === "O";
+      if (insertEntry) {
+        // Host autocmd `monaco_mode` can lag slightly after insert-entry keys.
+        // Pull mode via RPC to reduce the window where the first characters of a
+        // delegated insert go through the non-delegated pipeline.
+        this.scheduleModePull();
+      }
+      if (keys === "i") {
+        // Optimistically enable delegated insert immediately to avoid a short
+        // window where mode notifications lag behind insert-entry keys.
+        this.insertDelegation.optimisticEnterDelegatedInsertFromKey(keys);
+      }
     }
   }
 
