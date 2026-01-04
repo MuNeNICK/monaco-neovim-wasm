@@ -85,7 +85,11 @@ export class InsertDelegationManager {
   optimisticEnterDelegatedInsertFromKey(prefixKey: string): void {
     const key = String(prefixKey ?? "");
     if (!key || key.length !== 1) return;
-    const safePrefix = key === "i" || key === "a" || key === "I" || key === "A" || key === "o" || key === "O";
+    // Only `i` is unambiguous enough for optimistic delegation.
+    // Other insert-entry keys like `a`/`o` are also used as arguments for many
+    // normal-mode commands (e.g. `ma`, `"ap`, `@a`), and enabling delegation
+    // there can cause typed keys to be inserted into Monaco unexpectedly.
+    const safePrefix = key === "i";
     if (!safePrefix) return;
     if (this.delegateInsertToMonaco) return;
     if (this.exitingInsertMode) return;

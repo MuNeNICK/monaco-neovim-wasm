@@ -994,7 +994,6 @@ export class MonacoNeovimClient {
     const nextBlocking = blocking == null ? this.nvimBlocking : Boolean(blocking);
     const modeChanged = Boolean(m && m !== this.lastMode);
     const blockingChanged = nextBlocking !== this.nvimBlocking;
-    if (!modeChanged && !blockingChanged) return;
     const prevMode = this.lastMode;
     if (modeChanged) {
       this.lastMode = m;
@@ -1002,7 +1001,12 @@ export class MonacoNeovimClient {
       this.setMonacoHighlightsSuppressed(false);
     }
     this.nvimBlocking = nextBlocking;
+    // Always reconcile insert delegation when we receive a mode update.
+    // Delegation can be toggled optimistically (without an immediate mode change),
+    // and redundant `monaco_mode` notifies (same mode string) must still be able
+    // to turn delegation back off.
     this.insertDelegation.applyMode(this.lastMode);
+    if (!modeChanged && !blockingChanged) return;
 
     if (modeChanged) {
       this.cursor.applyCursorStyle(m);
@@ -1071,7 +1075,7 @@ export class MonacoNeovimClient {
       && !this.insertDelegation.isExitingInsertMode()
       && typeof keys === "string"
       && keys.length === 1
-      && (keys === "i" || keys === "a" || keys === "I" || keys === "A" || keys === "o" || keys === "O")
+      && keys === "i"
     ) {
       // Optimistically enable delegated insert immediately to avoid a short
       // window where mode notifications lag behind insert-entry keys.
