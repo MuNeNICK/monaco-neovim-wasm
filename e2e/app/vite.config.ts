@@ -3,6 +3,9 @@ import { fileURLToPath } from "node:url";
 
 export default defineConfig({
   root: fileURLToPath(new URL(".", import.meta.url)),
+  resolve: {
+    preserveSymlinks: true,
+  },
   server: {
     port: 4173,
     strictPort: true,
@@ -15,6 +18,7 @@ export default defineConfig({
     outDir: "dist",
     emptyOutDir: true,
   },
+  assetsInclude: ["**/*.wasm", "**/*.tar.gz"],
   optimizeDeps: {
     exclude: ["@monaco-neovim-wasm/wasm-async", "@monaco-neovim-wasm/lib"],
   },

@@ -210,9 +210,10 @@ export class BufferSyncManager {
     const state = this.init.ensureActiveState();
     if (!state || state.model !== model) return { kind: "noop" };
 
-    if (!state.shadowLines) {
+    if (!state.shadowLines || state.pendingFullSync) {
       state.pendingFullSync = true;
       state.pendingCursorSync = true;
+      state.pendingBufEdits = [];
       try { state.shadowLines = model.getLinesContent(); } catch (_) { state.shadowLines = null; }
       this.scheduleFlushPendingMonacoSync();
       return { kind: "delegatedInsertPatched", resetDotRepeat: true, resetReplayPossible: true };
@@ -221,6 +222,7 @@ export class BufferSyncManager {
     if (!ev.changes || ev.changes.length !== 1) {
       state.pendingFullSync = true;
       state.pendingCursorSync = true;
+      state.pendingBufEdits = [];
       try { state.shadowLines = model.getLinesContent(); } catch (_) { state.shadowLines = null; }
       this.scheduleFlushPendingMonacoSync();
       return { kind: "delegatedInsertPatched", resetDotRepeat: true, resetReplayPossible: true };
