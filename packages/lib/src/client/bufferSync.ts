@@ -266,6 +266,8 @@ export class BufferSyncManager {
     const state = this.init.getActiveState();
     if (!state) return;
     state.pendingCursorSync = true;
+    state.pendingFullSync = true;
+    try { state.shadowLines = state.model.getLinesContent(); } catch (_) { state.shadowLines = null; }
     this.scheduleFlushPendingMonacoSync();
   }
 
